@@ -1,74 +1,106 @@
 # Publicar o ClipFinder sem Docker
 
-Esta é a arquitetura recomendada para a versão atual:
+Arquitetura usada:
 
-- **GitHub:** guarda o código.
-- **Railway:** executa o backend FastAPI, fornece PostgreSQL e mantém os vídeos em um volume.
-- **Vercel:** publica o frontend Next.js.
+- **GitHub:** código-fonte.
+- **Railway:** FastAPI, PostgreSQL, Railway Bucket e volume temporário.
+- **Vercel:** frontend Next.js.
 
-## Antes de publicar
+## Segurança
 
-A API atual ainda não possui login. Enquanto isso, qualquer pessoa que descobrir o endereço da API poderá tentar acessar seus endpoints. Não divulgue o endereço como aplicação pública até adicionar autenticação.
+A API ainda não possui login. Enquanto a autenticação não for implementada, qualquer pessoa com o endereço poderá criar e excluir projetos. Não divulgue o site publicamente.
 
-## 1. Enviar o projeto ao GitHub
+## Backend e banco na Railway
 
-Crie um repositório vazio no GitHub e envie a pasta `Clipfinder`. Os arquivos `.env`, vídeos e senhas já estão ignorados e não devem ser enviados.
-
-## 2. Criar o backend na Railway
-
-1. Crie um projeto vazio na Railway.
-2. Adicione um PostgreSQL pelo botão **New → Database → PostgreSQL**.
-3. Adicione um serviço usando o repositório do GitHub.
-4. Nas configurações do serviço, informe:
+1. Crie um projeto na Railway.
+2. Adicione um PostgreSQL.
+3. Importe o repositório GitHub como um novo serviço.
+4. Configure o serviço:
    - **Root Directory:** `/backend`
    - **Config File Path:** `/backend/railway.json`
    - **Builder:** Railpack
-5. Crie um domínio público em **Settings → Networking → Generate Domain**.
+5. Em **Settings → Networking**, gere um domínio público.
 
-### Variáveis do backend
-
-Na aba **Variables** do serviço FastAPI, configure:
+### Variáveis básicas do backend
 
 ```env
 DATABASE_URL=${{Postgres.DATABASE_URL}}
 STORAGE_PATH=/app/storage
-CORS_ORIGINS=https://SEU-FRONTEND.vercel.app
+CORS_ORIGINS=https://SEU-FRONTEND.vercel.app,http://localhost:3000
 YOUTUBE_API_KEY=
 ```
 
-O nome `Postgres` precisa ser igual ao nome do serviço de banco mostrado na Railway. A chave do YouTube é opcional.
+## Railway Bucket para vídeos grandes
 
-### Volume para os vídeos
+1. No canvas do projeto, clique em **Create → Bucket**.
+2. Use o nome `clipfinder-storage`.
+3. No serviço `clipfinder`, abra **Variables**.
+4. Adicione estas referências ao Bucket:
 
-Adicione um volume ao serviço FastAPI e use exatamente este caminho de montagem:
+```env
+BUCKET_NAME=${{clipfinder-storage.BUCKET}}
+BUCKET_ACCESS_KEY_ID=${{clipfinder-storage.ACCESS_KEY_ID}}
+BUCKET_SECRET_ACCESS_KEY=${{clipfinder-storage.SECRET_ACCESS_KEY}}
+BUCKET_ENDPOINT=${{clipfinder-storage.ENDPOINT}}
+BUCKET_REGION=${{clipfinder-storage.REGION}}
+BUCKET_URL_STYLE=virtual
+MAX_UPLOAD_SIZE_GB=10
+```
+
+Se o Bucket tiver outro nome no canvas, substitua `clipfinder-storage` nas referências. Nunca copie os valores secretos para o GitHub ou para o frontend.
+
+Quando as credenciais estão presentes, o ClipFinder automaticamente:
+
+- configura o CORS do Bucket com os endereços de `CORS_ORIGINS`;
+- envia arquivos grandes em partes de 16 MB;
+- armazena originais, referências e cortes no Bucket;
+- mantém links e credenciais privados;
+- remove os objetos ao excluir o projeto.
+
+Confira a conexão abrindo:
+
+```text
+https://SEU-BACKEND.up.railway.app/health/storage
+```
+
+O resultado esperado é:
+
+```json
+{"storage":"bucket"}
+```
+
+### Volume temporário
+
+Mantenha um volume montado em:
 
 ```text
 /app/storage
 ```
 
-Sem o volume, os vídeos enviados desaparecem quando o serviço é atualizado. Observe também o espaço disponível no plano escolhido: vídeos ocupam bastante armazenamento.
+Os arquivos permanentes ficam no Bucket. O volume continua útil para arquivos locais antigos e temporários. Cortes muito longos ainda podem exigir mais espaço temporário.
 
-## 3. Criar o frontend na Vercel
+## Frontend na Vercel
 
-1. Na Vercel, selecione **Add New → Project**.
-2. Importe o mesmo repositório do GitHub.
-3. Configure **Root Directory** como `frontend`.
-4. Adicione a variável:
+1. Importe o mesmo repositório na Vercel.
+2. Selecione **Root Directory** como `frontend`.
+3. Use o preset **Next.js**.
+4. Deixe **Output Directory** sem override.
+5. Adicione:
 
 ```env
 NEXT_PUBLIC_API_URL=https://SEU-BACKEND.up.railway.app
 ```
 
-5. Publique o projeto.
+6. Publique o projeto.
+7. Volte à Railway e coloque o endereço final da Vercel em `CORS_ORIGINS`.
 
-Depois de conhecer o endereço final da Vercel, volte à Railway e altere `CORS_ORIGINS` para esse endereço exato. Em seguida, faça um novo deploy do backend.
+## Verificação
 
-## 4. Conferir
+- `/health` deve responder `{"status":"ok"}`.
+- `/health/storage` deve responder `{"storage":"bucket"}`.
+- `/docs` deve abrir o Swagger.
+- Envie primeiro um arquivo pequeno e depois valide um upload grande.
 
-- Abra `https://SEU-BACKEND.up.railway.app/health` e confirme `{"status":"ok"}`.
-- Abra `https://SEU-BACKEND.up.railway.app/docs` para conferir o Swagger.
-- Abra o endereço da Vercel, crie um projeto de teste e envie arquivos pequenos primeiro.
+## Custos
 
-## Observação sobre custos
-
-Processamento e armazenamento de vídeos consomem CPU, memória, tráfego e espaço em disco. Um volume gratuito pequeno pode comportar apenas um vídeo original. Defina limite de gastos e acompanhe o uso antes de trabalhar com arquivos grandes.
+Armazenamento, CPU, memória e tráfego podem consumir créditos. Configure um limite de gastos na Railway e exclua projetos que não serão mais usados.

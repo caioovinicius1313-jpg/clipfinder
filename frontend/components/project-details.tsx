@@ -152,6 +152,8 @@ export function ProjectDetails({ projectId }: ProjectDetailsProps) {
   const [isLoading, setIsLoading] = useState(true);
   const [isUploadingSource, setIsUploadingSource] = useState(false);
   const [isUploadingReference, setIsUploadingReference] = useState(false);
+  const [sourceUploadProgress, setSourceUploadProgress] = useState(0);
+  const [referenceUploadProgress, setReferenceUploadProgress] = useState(0);
   const [isSearchingYoutube, setIsSearchingYoutube] = useState(false);
   const [isGenerating, setIsGenerating] = useState(false);
   const [importingYoutubeId, setImportingYoutubeId] = useState<string | null>(null);
@@ -182,8 +184,9 @@ export function ProjectDetails({ projectId }: ProjectDetailsProps) {
     if (!selectedSourceFile) return;
     clearMessages();
     setIsUploadingSource(true);
+    setSourceUploadProgress(0);
     try {
-      await uploadSourceVideo(projectId, selectedSourceFile);
+      await uploadSourceVideo(projectId, selectedSourceFile, setSourceUploadProgress);
       await loadProject();
       setSelectedSourceFile(null);
       setNotice("Vídeo original enviado.");
@@ -191,6 +194,7 @@ export function ProjectDetails({ projectId }: ProjectDetailsProps) {
       setError(requestError instanceof Error ? requestError.message : "Não foi possível enviar o vídeo.");
     } finally {
       setIsUploadingSource(false);
+      setSourceUploadProgress(0);
     }
   }
 
@@ -198,8 +202,9 @@ export function ProjectDetails({ projectId }: ProjectDetailsProps) {
     if (!selectedReferenceFile) return;
     clearMessages();
     setIsUploadingReference(true);
+    setReferenceUploadProgress(0);
     try {
-      await uploadReferenceVideo(projectId, selectedReferenceFile);
+      await uploadReferenceVideo(projectId, selectedReferenceFile, setReferenceUploadProgress);
       await loadProject();
       setSelectedReferenceFile(null);
       setNotice("Vídeo de referência enviado.");
@@ -207,6 +212,7 @@ export function ProjectDetails({ projectId }: ProjectDetailsProps) {
       setError(requestError instanceof Error ? requestError.message : "Não foi possível enviar a referência.");
     } finally {
       setIsUploadingReference(false);
+      setReferenceUploadProgress(0);
     }
   }
 
@@ -286,8 +292,16 @@ export function ProjectDetails({ projectId }: ProjectDetailsProps) {
           {!selectedSourceFile && latestSourceVideo && <VideoInfo video={latestSourceVideo} />}
         </div>
         <button type="button" onClick={handleSourceUpload} disabled={!selectedSourceFile || isUploadingSource} className="mt-6 rounded-lg bg-indigo-600 px-5 py-2.5 font-semibold text-white hover:bg-indigo-700 disabled:cursor-not-allowed disabled:bg-indigo-300">
-          {isUploadingSource ? "Enviando..." : "Enviar vídeo original"}
+          {isUploadingSource ? `Enviando ${sourceUploadProgress}%` : "Enviar vídeo original"}
         </button>
+        {isUploadingSource && (
+          <div className="mt-4" aria-label={`Upload do vídeo original: ${sourceUploadProgress}%`}>
+            <div className="h-2 overflow-hidden rounded-full bg-slate-200">
+              <div className="h-full rounded-full bg-indigo-600 transition-all" style={{ width: `${sourceUploadProgress}%` }} />
+            </div>
+            <p className="mt-2 text-sm text-slate-600">Não feche esta página durante o envio.</p>
+          </div>
+        )}
       </section>
 
       <section className="mt-6 max-w-3xl rounded-xl border border-slate-200 bg-white p-6 sm:p-8">
@@ -296,8 +310,15 @@ export function ProjectDetails({ projectId }: ProjectDetailsProps) {
         <input type="file" accept="video/*" onChange={(event) => setSelectedReferenceFile(event.target.files?.[0] ?? null)} className="mt-6 block w-full cursor-pointer rounded-lg border border-slate-300 p-2 text-sm text-slate-700" />
         {selectedReferenceFile && <p className="mt-3 text-sm text-slate-700">Selecionado: {selectedReferenceFile.name}</p>}
         <button type="button" onClick={handleReferenceUpload} disabled={!selectedReferenceFile || isUploadingReference} className="mt-5 rounded-lg bg-indigo-600 px-5 py-2.5 font-semibold text-white hover:bg-indigo-700 disabled:cursor-not-allowed disabled:bg-indigo-300">
-          {isUploadingReference ? "Enviando..." : "Enviar corte de referência"}
+          {isUploadingReference ? `Enviando ${referenceUploadProgress}%` : "Enviar corte de referência"}
         </button>
+        {isUploadingReference && (
+          <div className="mt-4" aria-label={`Upload da referência: ${referenceUploadProgress}%`}>
+            <div className="h-2 overflow-hidden rounded-full bg-slate-200">
+              <div className="h-full rounded-full bg-indigo-600 transition-all" style={{ width: `${referenceUploadProgress}%` }} />
+            </div>
+          </div>
+        )}
         {uploadedReferences.length > 0 && <div className="mt-6 space-y-3">{uploadedReferences.map((reference) => <ReferenceCard key={reference.id} reference={reference} />)}</div>}
       </section>
 

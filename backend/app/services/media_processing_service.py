@@ -4,6 +4,7 @@ import subprocess
 import tempfile
 from dataclasses import dataclass, replace
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import imageio_ffmpeg
 import numpy as np
@@ -43,7 +44,7 @@ class MediaProcessingService:
 
         return imageio_ffmpeg.get_ffmpeg_exe()
 
-    def probe_duration(self, file_path: Path) -> float | None:
+    def probe_duration(self, file_path: str | Path) -> float | None:
         command = [self.get_ffmpeg_executable(), "-hide_banner", "-i", str(file_path)]
         result = subprocess.run(command, capture_output=True, text=True, check=False)
         duration_match = re.search(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)", result.stderr)
@@ -53,7 +54,7 @@ class MediaProcessingService:
         hours, minutes, seconds = duration_match.groups()
         return int(hours) * 3_600 + int(minutes) * 60 + float(seconds)
 
-    def extract_audio_samples(self, file_path: Path, *, sample_rate: int) -> np.ndarray:
+    def extract_audio_samples(self, file_path: str | Path, *, sample_rate: int) -> np.ndarray:
         command = [
             self.get_ffmpeg_executable(),
             "-v",
@@ -80,7 +81,7 @@ class MediaProcessingService:
             )
             if any(marker in detail for marker in missing_audio_markers):
                 raise MediaProcessingError(
-                    f'O arquivo "{file_path.name}" não possui uma faixa de áudio. '
+                    f'O arquivo "{self._media_name(file_path)}" não possui uma faixa de áudio. '
                     "Envie um vídeo original que contenha imagem e áudio."
                 )
             raise MediaProcessingError(f"Não foi possível ler o áudio do vídeo: {detail}")
@@ -91,7 +92,7 @@ class MediaProcessingService:
 
         return samples
 
-    def extract_audio_envelope(self, file_path: Path) -> np.ndarray:
+    def extract_audio_envelope(self, file_path: str | Path) -> np.ndarray:
         samples = self.extract_audio_samples(file_path, sample_rate=self.sample_rate)
         frame_size = self.sample_rate // self.envelope_rate
         usable_samples = samples.size - (samples.size % frame_size)
@@ -102,7 +103,7 @@ class MediaProcessingService:
     def generate_clip(
         self,
         *,
-        source_path: Path,
+        source_path: str | Path,
         output_path: Path,
         start_seconds: float,
         duration_seconds: float,
@@ -124,11 +125,13 @@ class MediaProcessingService:
             "-c:v",
             "libx264",
             "-preset",
-            "veryfast",
+            "medium",
             "-crf",
-            "20",
+            "18",
             "-c:a",
             "aac",
+            "-b:a",
+            "192k",
             "-movflags",
             "+faststart",
             str(output_path),
@@ -141,7 +144,7 @@ class MediaProcessingService:
     def generate_montage(
         self,
         *,
-        source_path: Path,
+        source_path: str | Path,
         output_path: Path,
         segments: list[tuple[float, float]],
     ) -> None:
@@ -197,6 +200,12 @@ class MediaProcessingService:
                 detail = result.stderr.decode("utf-8", errors="replace").strip()
                 raise MediaProcessingError(f"Não foi possível montar o corte: {detail}")
 
+    @staticmethod
+    def _media_name(file_path: str | Path) -> str:
+        value = str(file_path)
+        parsed_path = urlsplit(value).path if "://" in value else value
+        return Path(parsed_path).name or "vídeo"
+
 
 class AudioMatchingService:
     minimum_score = 0.45
@@ -210,7 +219,9 @@ class AudioMatchingService:
     def __init__(self, media_service: MediaProcessingService | None = None) -> None:
         self.media_service = media_service or MediaProcessingService()
 
-    def find_match(self, source_path: Path, reference_path: Path) -> tuple[float, float, float]:
+    def find_match(
+        self, source_path: str | Path, reference_path: str | Path
+    ) -> tuple[float, float, float]:
         source_envelope = self.media_service.extract_audio_envelope(source_path)
         reference_envelope = self.media_service.extract_audio_envelope(reference_path)
         start_frame, score = self.find_match_in_envelopes(source_envelope, reference_envelope)
@@ -218,7 +229,7 @@ class AudioMatchingService:
         return start_frame / self.media_service.envelope_rate, duration_seconds, score
 
     def find_segmented_matches(
-        self, source_path: Path, reference_path: Path
+        self, source_path: str | Path, reference_path: str | Path
     ) -> list[AudioSegmentMatch]:
         source_envelope = self.media_service.extract_audio_envelope(source_path)
         reference_envelope = self.media_service.extract_audio_envelope(reference_path)

@@ -7,6 +7,7 @@ ClipFinder organiza um vídeo original, referências de cortes e os clipes encon
 - Criar e listar projetos.
 - Excluir projetos e todos os arquivos associados com confirmação no dashboard.
 - Enviar o vídeo original do projeto.
+- Enviar vídeos grandes em partes para um Railway Bucket, quando configurado.
 - Enviar arquivos de vídeo que servem como referências de corte.
 - Buscar vídeos no YouTube por palavra-chave e salvar seus links como referência do projeto.
 - Comparar o áudio das referências enviadas com o vídeo original.
@@ -97,6 +98,10 @@ Depois feche as duas janelas abertas e execute ` .\start-local.ps1` novamente. S
 | `DELETE` | `/projects/{id}` | Exclui o projeto e seus arquivos |
 | `POST` | `/projects/{id}/upload` | Envia o vídeo original |
 | `POST` | `/projects/{id}/reference-videos/upload` | Envia um arquivo de referência |
+| `POST` | `/projects/{id}/uploads/multipart` | Inicia um upload grande no Bucket |
+| `POST` | `/projects/{id}/uploads/multipart/part-url` | Autoriza uma parte do upload |
+| `POST` | `/projects/{id}/uploads/multipart/complete` | Conclui e registra o arquivo |
+| `POST` | `/projects/{id}/uploads/multipart/abort` | Cancela um upload incompleto |
 | `GET` | `/projects/{id}/youtube/search` | Busca vídeos no YouTube |
 | `POST` | `/projects/{id}/reference-videos/youtube` | Salva um link do YouTube como referência |
 | `POST` | `/projects/{id}/generated-clips` | Inicia a geração de cortes |

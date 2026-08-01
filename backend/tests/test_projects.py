@@ -1,4 +1,5 @@
 import subprocess
+import uuid
 from collections.abc import Generator
 from pathlib import Path
 
@@ -17,6 +18,9 @@ from app.services.media_processing_service import (
     MediaProcessingError,
     MediaProcessingService,
 )
+from app.services.multipart_upload_service import MultipartUploadService
+from app.services.storage_service import StorageService
+from app.schemas.storage import MultipartUploadStart
 
 
 @pytest.fixture()
@@ -83,6 +87,17 @@ def test_create_list_and_upload_source_video(client: TestClient, tmp_path: Path)
     )
     assert reference_response.status_code == 201
     assert reference_response.json()["source"] == "upload"
+
+    multipart_response = client.post(
+        f"/projects/{project['id']}/uploads/multipart",
+        json={
+            "filename": "original-grande.mp4",
+            "content_type": "video/mp4",
+            "size": 1_500_000_000,
+            "kind": "source",
+        },
+    )
+    assert multipart_response.status_code == 503
 
     updated_detail_response = client.get(f"/projects/{project['id']}")
     assert len(updated_detail_response.json()["reference_videos"]) == 1
@@ -160,3 +175,45 @@ def test_audio_extraction_explains_when_file_has_no_audio(monkeypatch: pytest.Mo
 
     with pytest.raises(MediaProcessingError, match="não possui uma faixa de áudio"):
         media_service.extract_audio_envelope(Path("video-sem-audio.mp4"))
+
+
+def test_multipart_upload_uses_bucket_parts() -> None:
+    class FakeProjectService:
+        def get_by_id(self, database: object, project_id: object) -> object:
+            return object()
+
+    class FakeStorage:
+        bucket_enabled = True
+
+        def start_multipart_upload(self, *, object_key: str, content_type: str) -> str:
+            assert object_key.endswith(".mp4")
+            assert "/source/" in object_key
+            assert content_type == "video/mp4"
+            return "upload-123"
+
+    project_id = uuid.uuid4()
+    service = MultipartUploadService(
+        storage=FakeStorage(),  # type: ignore[arg-type]
+        project_service=FakeProjectService(),  # type: ignore[arg-type]
+    )
+    response = service.start(
+        object(),  # type: ignore[arg-type]
+        project_id=project_id,
+        payload=MultipartUploadStart(
+            filename="video-original.mp4",
+            content_type="video/mp4",
+            size=(16 * 1024 * 1024) + 1,
+            kind="source",
+        ),
+    )
+
+    assert response.upload_id == "upload-123"
+    assert response.part_count == 2
+    assert response.object_key.startswith(f"projects/{project_id}/source/")
+
+
+def test_storage_service_formats_bucket_paths() -> None:
+    stored_path = StorageService.bucket_path("projects/example/video.mp4")
+    assert stored_path == "bucket://projects/example/video.mp4"
+    assert StorageService.is_bucket_path(stored_path)
+    assert StorageService.object_key(stored_path) == "projects/example/video.mp4"

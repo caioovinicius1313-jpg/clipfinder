@@ -8,6 +8,7 @@ from app.core.config import settings
 from app.models.project import Project
 from app.repositories.project_repository import ProjectRepository
 from app.schemas.project import ProjectCreate
+from app.services.storage_service import StorageService
 
 
 class ProjectNotFoundError(Exception):
@@ -15,8 +16,13 @@ class ProjectNotFoundError(Exception):
 
 
 class ProjectService:
-    def __init__(self, repository: ProjectRepository | None = None) -> None:
+    def __init__(
+        self,
+        repository: ProjectRepository | None = None,
+        storage: StorageService | None = None,
+    ) -> None:
         self.repository = repository or ProjectRepository()
+        self.storage = storage or StorageService()
 
     def create(self, database: Session, payload: ProjectCreate) -> Project:
         return self.repository.create(
@@ -37,11 +43,11 @@ class ProjectService:
 
     def delete(self, database: Session, project_id: uuid.UUID) -> None:
         project = self.get_by_id(database, project_id)
-        self.repository.delete(database, project)
         self._delete_project_files(project_id)
+        self.repository.delete(database, project)
 
-    @staticmethod
-    def _delete_project_files(project_id: uuid.UUID) -> None:
+    def _delete_project_files(self, project_id: uuid.UUID) -> None:
+        self.storage.delete_prefix(f"projects/{project_id}/")
         projects_directory = (Path(settings.storage_path) / "projects").resolve()
         project_directory = (projects_directory / str(project_id)).resolve()
         if project_directory.parent != projects_directory:

@@ -1,4 +1,5 @@
 import uuid
+from pathlib import Path
 from typing import Annotated
 
 from fastapi import (
@@ -12,7 +13,7 @@ from fastapi import (
     UploadFile,
     status,
 )
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, RedirectResponse
 from sqlalchemy.orm import Session
 
 from app.api.dependencies import get_db
@@ -20,15 +21,29 @@ from app.schemas.generated_clip import MatchGenerationResponse
 from app.schemas.project import ProjectCreate, ProjectDetail, ProjectRead
 from app.schemas.reference_video import ReferenceVideoRead, YoutubeReferenceCreate
 from app.schemas.source_video import SourceVideoRead
+from app.schemas.storage import (
+    MultipartPartUrlRequest,
+    MultipartPartUrlResponse,
+    MultipartUploadAbort,
+    MultipartUploadComplete,
+    MultipartUploadStart,
+    MultipartUploadStartResponse,
+)
 from app.schemas.youtube import YoutubeSearchResult
 from app.services.generated_clip_service import (
     GeneratedClipNotAvailableError,
     GeneratedClipService,
 )
 from app.services.matching_service import MatchingPrerequisiteError, MatchingService
+from app.services.multipart_upload_service import InvalidUploadError, MultipartUploadService
 from app.services.project_service import ProjectNotFoundError, ProjectService
 from app.services.reference_video_service import ReferenceVideoService
 from app.services.source_video_service import SourceVideoService
+from app.services.storage_service import (
+    StorageConfigurationError,
+    StorageOperationError,
+    StoredFileNotFoundError,
+)
 from app.services.youtube_service import YoutubeConfigurationError, YoutubeRequestError, YoutubeService
 
 router = APIRouter(prefix="/projects", tags=["projects"])
@@ -61,6 +76,8 @@ def delete_project(project_id: uuid.UUID, database: DatabaseSession) -> Response
         return Response(status_code=status.HTTP_204_NO_CONTENT)
     except ProjectNotFoundError as error:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Project not found") from error
+    except StorageOperationError as error:
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(error)) from error
 
 
 @router.post("/{project_id}/upload", response_model=SourceVideoRead, status_code=status.HTTP_201_CREATED)
@@ -89,6 +106,98 @@ def upload_reference_video(
         return ReferenceVideoService().upload(database, project_id=project_id, file=file)
     except ProjectNotFoundError as error:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Project not found") from error
+
+
+@router.post(
+    "/{project_id}/uploads/multipart",
+    response_model=MultipartUploadStartResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+def start_multipart_upload(
+    project_id: uuid.UUID,
+    payload: MultipartUploadStart,
+    database: DatabaseSession,
+) -> MultipartUploadStartResponse:
+    try:
+        return MultipartUploadService().start(database, project_id=project_id, payload=payload)
+    except ProjectNotFoundError as error:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Project not found") from error
+    except StorageConfigurationError as error:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(error)) from error
+    except InvalidUploadError as error:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(error)) from error
+    except StorageOperationError as error:
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(error)) from error
+
+
+@router.post(
+    "/{project_id}/uploads/multipart/part-url",
+    response_model=MultipartPartUrlResponse,
+)
+def create_multipart_part_url(
+    project_id: uuid.UUID,
+    payload: MultipartPartUrlRequest,
+    database: DatabaseSession,
+) -> MultipartPartUrlResponse:
+    try:
+        url = MultipartUploadService().create_part_url(
+            database, project_id=project_id, payload=payload
+        )
+        return MultipartPartUrlResponse(url=url)
+    except ProjectNotFoundError as error:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Project not found") from error
+    except (InvalidUploadError, StoredFileNotFoundError) as error:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(error)) from error
+    except StorageConfigurationError as error:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(error)) from error
+    except StorageOperationError as error:
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(error)) from error
+
+
+@router.post(
+    "/{project_id}/uploads/multipart/complete",
+    response_model=SourceVideoRead | ReferenceVideoRead,
+    status_code=status.HTTP_201_CREATED,
+)
+def complete_multipart_upload(
+    project_id: uuid.UUID,
+    payload: MultipartUploadComplete,
+    database: DatabaseSession,
+) -> SourceVideoRead | ReferenceVideoRead:
+    try:
+        return MultipartUploadService().complete(
+            database, project_id=project_id, payload=payload
+        )
+    except ProjectNotFoundError as error:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Project not found") from error
+    except (InvalidUploadError, StoredFileNotFoundError) as error:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(error)) from error
+    except StorageConfigurationError as error:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(error)) from error
+    except StorageOperationError as error:
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(error)) from error
+
+
+@router.post(
+    "/{project_id}/uploads/multipart/abort",
+    status_code=status.HTTP_204_NO_CONTENT,
+)
+def abort_multipart_upload(
+    project_id: uuid.UUID,
+    payload: MultipartUploadAbort,
+    database: DatabaseSession,
+) -> Response:
+    try:
+        MultipartUploadService().abort(database, project_id=project_id, payload=payload)
+        return Response(status_code=status.HTTP_204_NO_CONTENT)
+    except ProjectNotFoundError as error:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Project not found") from error
+    except InvalidUploadError as error:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(error)) from error
+    except StorageConfigurationError as error:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(error)) from error
+    except StorageOperationError as error:
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(error)) from error
 
 
 @router.get("/{project_id}/youtube/search", response_model=list[YoutubeSearchResult])
@@ -156,12 +265,14 @@ def download_generated_clip(
     project_id: uuid.UUID,
     clip_id: uuid.UUID,
     database: DatabaseSession,
-) -> FileResponse:
+) -> Response:
     try:
-        clip, absolute_path = GeneratedClipService().get_download_path(
+        clip, target = GeneratedClipService().get_download_target(
             database, project_id=project_id, clip_id=clip_id
         )
-        return FileResponse(absolute_path, media_type="video/mp4", filename=f"clip-{clip.id}.mp4")
+        if isinstance(target, Path):
+            return FileResponse(target, media_type="video/mp4", filename=f"clip-{clip.id}.mp4")
+        return RedirectResponse(target, status_code=status.HTTP_307_TEMPORARY_REDIRECT)
     except ProjectNotFoundError as error:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Project not found") from error
     except GeneratedClipNotAvailableError as error:

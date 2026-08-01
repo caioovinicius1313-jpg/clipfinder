@@ -1,5 +1,6 @@
 from functools import lru_cache
 
+from pydantic import AliasChoices, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -10,6 +11,36 @@ class Settings(BaseSettings):
     cors_origins: str = "http://localhost:3000"
     youtube_api_key: str | None = None
     ffmpeg_path: str | None = None
+    bucket_name: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("BUCKET_NAME", "BUCKET", "AWS_S3_BUCKET_NAME"),
+    )
+    bucket_access_key_id: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "BUCKET_ACCESS_KEY_ID", "ACCESS_KEY_ID", "AWS_ACCESS_KEY_ID"
+        ),
+    )
+    bucket_secret_access_key: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "BUCKET_SECRET_ACCESS_KEY", "SECRET_ACCESS_KEY", "AWS_SECRET_ACCESS_KEY"
+        ),
+    )
+    bucket_endpoint: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices("BUCKET_ENDPOINT", "ENDPOINT", "AWS_ENDPOINT_URL"),
+    )
+    bucket_region: str = Field(
+        default="auto",
+        validation_alias=AliasChoices("BUCKET_REGION", "REGION", "AWS_DEFAULT_REGION"),
+    )
+    bucket_url_style: str = Field(
+        default="virtual",
+        validation_alias=AliasChoices("BUCKET_URL_STYLE", "AWS_S3_URL_STYLE"),
+    )
+    bucket_presigned_expiration: int = 43_200
+    max_upload_size_gb: int = 10
 
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
@@ -24,6 +55,17 @@ class Settings(BaseSettings):
     @property
     def allowed_origins(self) -> list[str]:
         return [origin.strip() for origin in self.cors_origins.split(",") if origin.strip()]
+
+    @property
+    def bucket_enabled(self) -> bool:
+        return all(
+            (
+                self.bucket_name,
+                self.bucket_access_key_id,
+                self.bucket_secret_access_key,
+                self.bucket_endpoint,
+            )
+        )
 
 
 @lru_cache
