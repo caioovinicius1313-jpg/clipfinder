@@ -1,0 +1,24 @@
+# Environment and local state
+.env
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+backend/.test-temp/
+.pnpm-store/
+.ruff_cache/
+
+# Node.js / Next.js
+frontend/node_modules/
+frontend/.next/
+frontend/out/
+
+# User-uploaded files (the directory itself is retained)
+storage/*
+!storage/.gitkeep
+
+# Editor and operating-system files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
