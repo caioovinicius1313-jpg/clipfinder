@@ -1,3 +1,4 @@
+import logging
 import re
 import shutil
 import subprocess
@@ -10,6 +11,9 @@ import imageio_ffmpeg
 import numpy as np
 
 from app.core.config import settings
+
+
+logger = logging.getLogger(__name__)
 
 
 class MediaProcessingError(Exception):
@@ -122,8 +126,75 @@ class MediaProcessingService:
         output_path: Path,
         start_seconds: float,
         duration_seconds: float,
-    ) -> None:
+    ) -> str:
         output_path.parent.mkdir(parents=True, exist_ok=True)
+        command = [
+            self.get_ffmpeg_executable(),
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-nostdin",
+            "-y",
+            "-filter_threads",
+            "1",
+            "-threads",
+            "1",
+            "-ss",
+            f"{start_seconds:.3f}",
+            "-i",
+            str(source_path),
+            "-t",
+            f"{duration_seconds:.3f}",
+            "-map",
+            "0:v:0?",
+            "-map",
+            "0:a:0?",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-tune",
+            "zerolatency",
+            "-crf",
+            "18",
+            "-vf",
+            "pad=ceil(iw/2)*2:ceil(ih/2)*2",
+            "-threads",
+            "1",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "192k",
+            "-movflags",
+            "+faststart",
+            str(output_path),
+        ]
+        result = subprocess.run(command, capture_output=True, check=False)
+        if result.returncode == -9:
+            logger.warning(
+                "O encoder excedeu a memória; repetindo o corte sem recodificação."
+            )
+            output_path.unlink(missing_ok=True)
+            self._generate_clip_by_stream_copy(
+                source_path=source_path,
+                output_path=output_path,
+                start_seconds=start_seconds,
+                duration_seconds=duration_seconds,
+            )
+            return "copied"
+        if result.returncode != 0:
+            detail = self._ffmpeg_error_detail(result)
+            raise MediaProcessingError(f"Não foi possível gerar o corte: {detail}")
+        return "encoded"
+
+    def _generate_clip_by_stream_copy(
+        self,
+        *,
+        source_path: str | Path,
+        output_path: Path,
+        start_seconds: float,
+        duration_seconds: float,
+    ) -> None:
         command = [
             self.get_ffmpeg_executable(),
             "-hide_banner",
@@ -141,20 +212,10 @@ class MediaProcessingService:
             "0:v:0?",
             "-map",
             "0:a:0?",
-            "-c:v",
-            "libx264",
-            "-preset",
-            "veryfast",
-            "-crf",
-            "18",
-            "-vf",
-            "pad=ceil(iw/2)*2:ceil(ih/2)*2",
-            "-threads",
-            "1",
-            "-c:a",
-            "aac",
-            "-b:a",
-            "192k",
+            "-c",
+            "copy",
+            "-avoid_negative_ts",
+            "make_zero",
             "-movflags",
             "+faststart",
             str(output_path),
@@ -162,7 +223,9 @@ class MediaProcessingService:
         result = subprocess.run(command, capture_output=True, check=False)
         if result.returncode != 0:
             detail = self._ffmpeg_error_detail(result)
-            raise MediaProcessingError(f"Não foi possível gerar o corte: {detail}")
+            raise MediaProcessingError(
+                f"Não foi possível gerar o corte no modo de baixo consumo: {detail}"
+            )
 
     def generate_montage(
         self,
@@ -188,15 +251,30 @@ class MediaProcessingService:
         with tempfile.TemporaryDirectory(prefix="clipfinder-") as temporary_directory:
             temporary_path = Path(temporary_directory)
             part_paths: list[Path] = []
+            part_modes: list[str] = []
             for index, (start_seconds, duration_seconds) in enumerate(segments):
                 part_path = temporary_path / f"part-{index:03d}.mp4"
-                self.generate_clip(
-                    source_path=source_path,
-                    output_path=part_path,
-                    start_seconds=start_seconds,
-                    duration_seconds=duration_seconds,
+                part_modes.append(
+                    self.generate_clip(
+                        source_path=source_path,
+                        output_path=part_path,
+                        start_seconds=start_seconds,
+                        duration_seconds=duration_seconds,
+                    )
                 )
                 part_paths.append(part_path)
+
+            if len(set(part_modes)) > 1:
+                for part_path, (start_seconds, duration_seconds) in zip(
+                    part_paths, segments, strict=True
+                ):
+                    part_path.unlink(missing_ok=True)
+                    self._generate_clip_by_stream_copy(
+                        source_path=source_path,
+                        output_path=part_path,
+                        start_seconds=start_seconds,
+                        duration_seconds=duration_seconds,
+                    )
 
             manifest_path = temporary_path / "parts.txt"
             manifest_path.write_text(

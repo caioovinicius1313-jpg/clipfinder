@@ -203,6 +203,37 @@ def test_probe_identifies_video_and_audio_streams(monkeypatch: pytest.MonkeyPatc
     )
 
 
+def test_generate_clip_falls_back_when_encoder_exceeds_memory(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    media_service = MediaProcessingService()
+    monkeypatch.setattr(media_service, "get_ffmpeg_executable", lambda: "ffmpeg")
+    commands: list[list[str]] = []
+    results = iter(
+        (
+            subprocess.CompletedProcess(args=[], returncode=-9, stdout=b"", stderr=b""),
+            subprocess.CompletedProcess(args=[], returncode=0, stdout=b"", stderr=b""),
+        )
+    )
+
+    def fake_run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[bytes]:
+        commands.append(command)
+        return next(results)
+
+    monkeypatch.setattr("app.services.media_processing_service.subprocess.run", fake_run)
+
+    mode = media_service.generate_clip(
+        source_path="original.mp4",
+        output_path=tmp_path / "clip.mp4",
+        start_seconds=10,
+        duration_seconds=20,
+    )
+
+    assert mode == "copied"
+    assert commands[0].index("-threads") < commands[0].index("-i")
+    assert commands[1][commands[1].index("-c") + 1] == "copy"
+
+
 def test_failed_clip_error_preserves_the_end() -> None:
     message = "começo" + ("x" * 2500) + "causa real"
 
