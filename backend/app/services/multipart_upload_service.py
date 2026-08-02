@@ -115,7 +115,14 @@ class MultipartUploadService:
                 raise InvalidUploadError(
                     "O tamanho recebido não corresponde ao arquivo selecionado. Tente novamente."
                 )
-            duration = self.media_service.probe_duration(self.storage.media_input(stored_path))
+            media_probe = self.media_service.probe(self.storage.media_input(stored_path))
+            if not media_probe.has_video:
+                raise InvalidUploadError("O arquivo enviado não possui uma faixa de vídeo.")
+            if not media_probe.has_audio:
+                raise InvalidUploadError(
+                    "O arquivo enviado não possui áudio. Escolha uma versão do vídeo com imagem e áudio."
+                )
+            duration = media_probe.duration_seconds
             if payload.kind == "source":
                 return self.source_repository.create(
                     database,

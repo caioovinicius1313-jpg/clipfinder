@@ -1,5 +1,6 @@
-import uuid
+import logging
 import tempfile
+import uuid
 from pathlib import Path
 
 from sqlalchemy.orm import Session
@@ -12,6 +13,9 @@ from app.repositories.reference_video_repository import ReferenceVideoRepository
 from app.repositories.source_video_repository import SourceVideoRepository
 from app.services.media_processing_service import AudioMatchNotFoundError, AudioMatchingService
 from app.services.storage_service import StorageService, StoredFileNotFoundError
+
+
+logger = logging.getLogger(__name__)
 
 
 class MatchingPrerequisiteError(Exception):
@@ -70,6 +74,7 @@ class MatchingService:
                 try:
                     self._process_job(database, clip.id, source_video, reference_video)
                 except Exception as error:
+                    logger.exception("Falha ao processar o corte %s", clip.id)
                     self.generated_clip_repository.mark_failed(database, clip, str(error))
 
     def _process_job(

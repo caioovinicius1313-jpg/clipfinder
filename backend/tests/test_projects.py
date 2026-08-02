@@ -13,8 +13,10 @@ from app.api.dependencies import get_db
 from app.core.config import settings
 from app.core.database import Base
 from app.main import app
+from app.repositories.generated_clip_repository import GeneratedClipRepository
 from app.services.media_processing_service import (
     AudioMatchingService,
+    MediaProbe,
     MediaProcessingError,
     MediaProcessingService,
 )
@@ -175,6 +177,40 @@ def test_audio_extraction_explains_when_file_has_no_audio(monkeypatch: pytest.Mo
 
     with pytest.raises(MediaProcessingError, match="não possui uma faixa de áudio"):
         media_service.extract_audio_envelope(Path("video-sem-audio.mp4"))
+
+
+def test_probe_identifies_video_and_audio_streams(monkeypatch: pytest.MonkeyPatch) -> None:
+    media_service = MediaProcessingService()
+    monkeypatch.setattr(media_service, "get_ffmpeg_executable", lambda: "ffmpeg")
+    monkeypatch.setattr(
+        "app.services.media_processing_service.subprocess.run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(
+            args=args[0],
+            returncode=1,
+            stdout="",
+            stderr=(
+                "Duration: 00:01:02.50, start: 0.000000, bitrate: 1000 kb/s\n"
+                "Stream #0:0(und): Video: h264\n"
+                "Stream #0:1(und): Audio: aac"
+            ),
+        ),
+    )
+
+    assert media_service.probe("video.mp4") == MediaProbe(
+        duration_seconds=62.5,
+        has_video=True,
+        has_audio=True,
+    )
+
+
+def test_failed_clip_error_preserves_the_end() -> None:
+    message = "começo" + ("x" * 2500) + "causa real"
+
+    formatted = GeneratedClipRepository._format_error_message(message)
+
+    assert len(formatted) == 2000
+    assert formatted.startswith("começo")
+    assert formatted.endswith("causa real")
 
 
 def test_multipart_upload_uses_bucket_parts() -> None:

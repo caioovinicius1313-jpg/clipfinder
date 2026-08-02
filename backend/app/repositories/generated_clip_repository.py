@@ -51,7 +51,13 @@ class GeneratedClipRepository:
 
     def mark_failed(self, database: Session, clip: GeneratedClip, error_message: str) -> GeneratedClip:
         clip.status = "failed"
-        clip.error_message = error_message[:2000]
+        clip.error_message = self._format_error_message(error_message)
         database.commit()
         database.refresh(clip)
         return clip
+
+    @staticmethod
+    def _format_error_message(error_message: str) -> str:
+        if len(error_message) <= 2000:
+            return error_message
+        return f"{error_message[:300]}\n...\n{error_message[-1695:]}"

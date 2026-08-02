@@ -28,6 +28,13 @@ class AudioSegmentMatch:
     score: float
 
 
+@dataclass(frozen=True)
+class MediaProbe:
+    duration_seconds: float | None
+    has_video: bool
+    has_audio: bool
+
+
 class MediaProcessingService:
     sample_rate = 8_000
     envelope_rate = 50
@@ -44,15 +51,23 @@ class MediaProcessingService:
 
         return imageio_ffmpeg.get_ffmpeg_exe()
 
-    def probe_duration(self, file_path: str | Path) -> float | None:
+    def probe(self, file_path: str | Path) -> MediaProbe:
         command = [self.get_ffmpeg_executable(), "-hide_banner", "-i", str(file_path)]
         result = subprocess.run(command, capture_output=True, text=True, check=False)
         duration_match = re.search(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)", result.stderr)
-        if duration_match is None:
-            return None
+        duration_seconds: float | None = None
+        if duration_match is not None:
+            hours, minutes, seconds = duration_match.groups()
+            duration_seconds = int(hours) * 3_600 + int(minutes) * 60 + float(seconds)
 
-        hours, minutes, seconds = duration_match.groups()
-        return int(hours) * 3_600 + int(minutes) * 60 + float(seconds)
+        return MediaProbe(
+            duration_seconds=duration_seconds,
+            has_video=bool(re.search(r"Stream #[^\r\n]+:\s*Video:", result.stderr)),
+            has_audio=bool(re.search(r"Stream #[^\r\n]+:\s*Audio:", result.stderr)),
+        )
+
+    def probe_duration(self, file_path: str | Path) -> float | None:
+        return self.probe(file_path).duration_seconds
 
     def extract_audio_samples(self, file_path: str | Path, *, sample_rate: int) -> np.ndarray:
         command = [
@@ -111,6 +126,10 @@ class MediaProcessingService:
         output_path.parent.mkdir(parents=True, exist_ok=True)
         command = [
             self.get_ffmpeg_executable(),
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-nostdin",
             "-y",
             "-ss",
             f"{start_seconds:.3f}",
@@ -125,9 +144,13 @@ class MediaProcessingService:
             "-c:v",
             "libx264",
             "-preset",
-            "medium",
+            "veryfast",
             "-crf",
             "18",
+            "-vf",
+            "pad=ceil(iw/2)*2:ceil(ih/2)*2",
+            "-threads",
+            "1",
             "-c:a",
             "aac",
             "-b:a",
@@ -138,7 +161,7 @@ class MediaProcessingService:
         ]
         result = subprocess.run(command, capture_output=True, check=False)
         if result.returncode != 0:
-            detail = result.stderr.decode("utf-8", errors="replace").strip()
+            detail = self._ffmpeg_error_detail(result)
             raise MediaProcessingError(f"Não foi possível gerar o corte: {detail}")
 
     def generate_montage(
@@ -182,6 +205,10 @@ class MediaProcessingService:
             )
             command = [
                 self.get_ffmpeg_executable(),
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-nostdin",
                 "-y",
                 "-f",
                 "concat",
@@ -197,8 +224,26 @@ class MediaProcessingService:
             ]
             result = subprocess.run(command, capture_output=True, check=False)
             if result.returncode != 0:
-                detail = result.stderr.decode("utf-8", errors="replace").strip()
+                detail = self._ffmpeg_error_detail(result)
                 raise MediaProcessingError(f"Não foi possível montar o corte: {detail}")
+
+    @staticmethod
+    def _ffmpeg_error_detail(result: subprocess.CompletedProcess[bytes]) -> str:
+        detail = result.stderr.decode("utf-8", errors="replace").strip()
+        detail = re.sub(
+            r"(https?://[^?\s]+)\?[^\s'\"]+",
+            r"\1?<assinatura-oculta>",
+            detail,
+        )
+        if result.returncode < 0:
+            resource_message = (
+                f"o processo foi encerrado pelo servidor (sinal {-result.returncode}). "
+                "Verifique a memória disponível no Railway."
+            )
+            return f"{resource_message} Detalhes: {detail}" if detail else resource_message
+        if detail:
+            return detail
+        return f"o FFmpeg terminou com o código {result.returncode}, sem fornecer detalhes."
 
     @staticmethod
     def _media_name(file_path: str | Path) -> str:
