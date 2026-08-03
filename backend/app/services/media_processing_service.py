@@ -302,7 +302,7 @@ class MediaProcessingService:
 
 class AudioMatchingService:
     minimum_score = 0.45
-    minimum_segment_score = 0.35
+    minimum_segment_score = 0.30
     segment_seconds = 8
     minimum_segment_seconds = 3
     analysis_sample_rate = 4_000
@@ -310,7 +310,7 @@ class AudioMatchingService:
     refinement_sample_rate = analysis_sample_rate
     refinement_search_seconds = 3
     minimum_refinement_score = 0.15
-    minimum_reference_coverage = 0.5
+    minimum_reference_coverage = 0.6
     spectral_band_edges = (80, 160, 320, 640, 1_000, 1_400, 1_900)
     tempo_factors = (
         0.85,
@@ -538,10 +538,51 @@ class AudioMatchingService:
     def _find_best_match_in_features(
         source_features: np.ndarray, reference_features: np.ndarray
     ) -> tuple[int, float]:
+        spectral_scores = AudioMatchingService._feature_match_scores(
+            source_features,
+            reference_features,
+        )
+        source_fingerprint = AudioMatchingService._binary_fingerprint(source_features)
+        reference_fingerprint = AudioMatchingService._binary_fingerprint(reference_features)
+        fingerprint_scores = AudioMatchingService._feature_match_scores(
+            source_fingerprint,
+            reference_fingerprint,
+            allow_empty=True,
+        )
+        spectral_evidence = np.clip(spectral_scores, 0.0, 1.0)
+        fingerprint_evidence = np.clip(fingerprint_scores, 0.0, 1.0)
+        combined_scores = 1.0 - (
+            (1.0 - spectral_evidence) * (1.0 - fingerprint_evidence)
+        )
+        best_frame = int(np.argmax(combined_scores))
+        return best_frame, float(combined_scores[best_frame])
+
+    @staticmethod
+    def _binary_fingerprint(features: np.ndarray) -> np.ndarray:
+        band_count = features.shape[1] // 2
+        band_energy = features[:, :band_count]
+        spectral_changes = features[:, band_count:]
+        frame_median = np.median(band_energy, axis=1, keepdims=True)
+        energy_bits = np.where(band_energy >= frame_median, 1.0, -1.0)
+        change_bits = np.where(spectral_changes >= 0.0, 1.0, -1.0)
+        return np.concatenate((energy_bits, change_bits), axis=1).astype(np.float32)
+
+    @staticmethod
+    def _feature_match_scores(
+        source_features: np.ndarray,
+        reference_features: np.ndarray,
+        *,
+        allow_empty: bool = False,
+    ) -> np.ndarray:
         source = AudioMatchingService._normalize_columns(source_features)
         reference = AudioMatchingService._normalize_columns(reference_features)
         reference_energy = float(np.sum(np.square(reference)))
         if reference_energy <= 0:
+            if allow_empty:
+                return np.zeros(
+                    source_features.shape[0] - reference_features.shape[0] + 1,
+                    dtype=np.float64,
+                )
             raise MediaProcessingError("O áudio do vídeo de referência está silencioso.")
 
         correlation_size = source.shape[0] + reference.shape[0] - 1
@@ -562,8 +603,7 @@ class AudioMatchingService:
         scores = valid_correlation / np.sqrt(
             np.maximum(source_energy * reference_energy, 1e-12)
         )
-        best_frame = int(np.argmax(scores))
-        return best_frame, float(scores[best_frame])
+        return scores
 
     def find_match_in_envelopes(
         self, source_envelope: np.ndarray, reference_envelope: np.ndarray

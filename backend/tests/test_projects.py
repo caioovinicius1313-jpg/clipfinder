@@ -15,6 +15,7 @@ from app.core.database import Base
 from app.main import app
 from app.repositories.generated_clip_repository import GeneratedClipRepository
 from app.services.media_processing_service import (
+    AudioMatchNotFoundError,
     AudioSegmentMatch,
     AudioMatchingService,
     MediaProbe,
@@ -158,6 +159,25 @@ def test_spectral_matching_distinguishes_equal_volume_audio() -> None:
     assert score > 0.8
 
 
+def test_fingerprint_does_not_inflate_unrelated_audio_confidence() -> None:
+    import numpy as np
+
+    matching_service = AudioMatchingService()
+    sample_rate = matching_service.analysis_sample_rate
+    generator = np.random.default_rng(84)
+    source_samples = generator.normal(size=sample_rate * 30).astype(np.float32)
+    unrelated_samples = generator.normal(size=sample_rate * 8).astype(np.float32)
+
+    source_features = matching_service._spectral_features_from_samples(source_samples)
+    unrelated_features = matching_service._spectral_features_from_samples(unrelated_samples)
+    _, score, _ = matching_service._find_best_tempo_match(
+        source_features,
+        unrelated_features,
+    )
+
+    assert score < matching_service.minimum_score
+
+
 def test_real_reencoded_and_accelerated_audio_is_located_at_correct_time(
     tmp_path: Path,
 ) -> None:
@@ -275,6 +295,34 @@ def test_waveform_refinement_keeps_confirmed_spectral_match_when_audio_was_reenc
     )
 
     assert refined_match == spectral_match
+
+
+def test_lower_confidence_blocks_still_require_majority_coverage() -> None:
+    matching_service = AudioMatchingService()
+    matches = [
+        AudioSegmentMatch(
+            source_start_seconds=index * 10,
+            reference_start_seconds=index * 8,
+            duration_seconds=8,
+            reference_duration_seconds=8,
+            score=0.34,
+        )
+        for index in range(2)
+    ]
+
+    with pytest.raises(AudioMatchNotFoundError, match="cobertura 50%"):
+        matching_service._validate_reference_coverage(matches, reference_duration=32)
+
+    matches.append(
+        AudioSegmentMatch(
+            source_start_seconds=20,
+            reference_start_seconds=16,
+            duration_seconds=8,
+            reference_duration_seconds=8,
+            score=0.34,
+        )
+    )
+    matching_service._validate_reference_coverage(matches, reference_duration=32)
 
 
 def test_audio_extraction_explains_when_file_has_no_audio(monkeypatch: pytest.MonkeyPatch) -> None:
