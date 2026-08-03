@@ -158,7 +158,9 @@ def test_spectral_matching_distinguishes_equal_volume_audio() -> None:
     assert score > 0.8
 
 
-def test_real_reencoded_audio_is_located_at_the_correct_time(tmp_path: Path) -> None:
+def test_real_reencoded_and_accelerated_audio_is_located_at_correct_time(
+    tmp_path: Path,
+) -> None:
     media_service = MediaProcessingService()
     ffmpeg = media_service.get_ffmpeg_executable()
     source_path = tmp_path / "source.wav"
@@ -191,10 +193,12 @@ def test_real_reencoded_audio_is_located_at_the_correct_time(tmp_path: Path) -> 
             "-y",
             "-ss",
             str(expected_start_seconds),
-            "-i",
-            str(source_path),
             "-t",
             "7",
+            "-i",
+            str(source_path),
+            "-af",
+            "atempo=1.08",
             "-c:a",
             "aac",
             "-b:a",

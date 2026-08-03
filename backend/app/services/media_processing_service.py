@@ -30,6 +30,8 @@ class AudioSegmentMatch:
     reference_start_seconds: float
     duration_seconds: float
     score: float
+    reference_duration_seconds: float | None = None
+    tempo_factor: float = 1.0
 
 
 @dataclass(frozen=True)
@@ -300,7 +302,7 @@ class MediaProcessingService:
 
 class AudioMatchingService:
     minimum_score = 0.45
-    minimum_segment_score = 0.45
+    minimum_segment_score = 0.35
     segment_seconds = 8
     minimum_segment_seconds = 3
     analysis_sample_rate = 4_000
@@ -310,6 +312,21 @@ class AudioMatchingService:
     minimum_refinement_score = 0.15
     minimum_reference_coverage = 0.5
     spectral_band_edges = (80, 160, 320, 640, 1_000, 1_400, 1_900)
+    tempo_factors = (
+        0.85,
+        0.875,
+        0.9,
+        0.925,
+        0.95,
+        0.975,
+        1.0,
+        1.025,
+        1.05,
+        1.075,
+        1.1,
+        1.125,
+        1.15,
+    )
 
     def __init__(self, media_service: MediaProcessingService | None = None) -> None:
         self.media_service = media_service or MediaProcessingService()
@@ -325,13 +342,23 @@ class AudioMatchingService:
         )
         source_features = self._spectral_features_from_samples(source_samples)
         reference_features = self._spectral_features_from_samples(reference_samples)
-        start_frame, score = self.find_match_in_features(source_features, reference_features)
-        duration_seconds = reference_samples.size / self.analysis_sample_rate
+        start_frame, score, tempo_factor = self._find_best_tempo_match(
+            source_features, reference_features
+        )
+        if score < self.minimum_score:
+            raise AudioMatchNotFoundError(
+                "Nenhum trecho com assinatura de áudio suficientemente parecida foi encontrado "
+                f"(melhor confiança {score:.0%})."
+            )
+        reference_duration_seconds = reference_samples.size / self.analysis_sample_rate
+        duration_seconds = reference_duration_seconds * tempo_factor
         match = AudioSegmentMatch(
             source_start_seconds=start_frame / self.feature_rate,
             reference_start_seconds=0,
             duration_seconds=duration_seconds,
             score=score,
+            reference_duration_seconds=reference_duration_seconds,
+            tempo_factor=tempo_factor,
         )
         refined_match = self._refine_segment_match(
             match,
@@ -378,7 +405,7 @@ class AudioMatchingService:
         if reference_features.shape[0] >= source_features.shape[0]:
             raise MediaProcessingError("O vídeo de referência precisa ser menor que o vídeo original.")
 
-        best_frame, best_score = self._find_best_match_in_features(
+        best_frame, best_score, _ = self._find_best_tempo_match(
             source_features, reference_features
         )
         if best_score < self.minimum_score:
@@ -397,6 +424,7 @@ class AudioMatchingService:
         segment_frames = self.segment_seconds * self.feature_rate
         minimum_frames = self.minimum_segment_seconds * self.feature_rate
         candidates: list[AudioSegmentMatch] = []
+        best_scores: list[float] = []
         for reference_start_frame in range(0, reference_features.shape[0], segment_frames):
             reference_segment = reference_features[
                 reference_start_frame : reference_start_frame + segment_frames
@@ -404,23 +432,75 @@ class AudioMatchingService:
             if reference_segment.shape[0] < minimum_frames:
                 continue
 
-            source_start_frame, score = self._find_best_match_in_features(
+            source_start_frame, score, tempo_factor = self._find_best_tempo_match(
                 source_features, reference_segment
             )
+            best_scores.append(score)
             if score >= self.minimum_segment_score:
+                reference_duration_seconds = reference_segment.shape[0] / self.feature_rate
                 candidates.append(
                     AudioSegmentMatch(
                         source_start_seconds=source_start_frame / self.feature_rate,
                         reference_start_seconds=reference_start_frame / self.feature_rate,
-                        duration_seconds=reference_segment.shape[0] / self.feature_rate,
+                        duration_seconds=reference_duration_seconds * tempo_factor,
                         score=score,
+                        reference_duration_seconds=reference_duration_seconds,
+                        tempo_factor=tempo_factor,
                     )
                 )
 
         selected_matches = self._select_chronological_matches(candidates)
         reference_duration = reference_features.shape[0] / self.feature_rate
-        self._validate_reference_coverage(selected_matches, reference_duration)
+        self._validate_reference_coverage(
+            selected_matches,
+            reference_duration,
+            best_score=max(best_scores, default=0.0),
+        )
         return selected_matches
+
+    def _find_best_tempo_match(
+        self,
+        source_features: np.ndarray,
+        reference_features: np.ndarray,
+    ) -> tuple[int, float, float]:
+        best_frame = 0
+        best_score = float("-inf")
+        best_tempo_factor = 1.0
+        for tempo_factor in self.tempo_factors:
+            adjusted_reference = self._resample_features(reference_features, tempo_factor)
+            if adjusted_reference.shape[0] >= source_features.shape[0]:
+                continue
+            candidate_frame, candidate_score = self._find_best_match_in_features(
+                source_features, adjusted_reference
+            )
+            logger.debug(
+                "Candidato de tempo %.3f: confiança %.4f no frame %s",
+                tempo_factor,
+                candidate_score,
+                candidate_frame,
+            )
+            if candidate_score > best_score:
+                best_frame = candidate_frame
+                best_score = candidate_score
+                best_tempo_factor = tempo_factor
+        return best_frame, best_score, best_tempo_factor
+
+    @staticmethod
+    def _resample_features(features: np.ndarray, tempo_factor: float) -> np.ndarray:
+        target_length = max(1, round(features.shape[0] * tempo_factor))
+        if target_length == features.shape[0]:
+            return features
+
+        source_positions = np.arange(features.shape[0], dtype=np.float64)
+        target_positions = np.linspace(0, features.shape[0] - 1, target_length)
+        adjusted = np.empty((target_length, features.shape[1]), dtype=features.dtype)
+        for column_index in range(features.shape[1]):
+            adjusted[:, column_index] = np.interp(
+                target_positions,
+                source_positions,
+                features[:, column_index],
+            )
+        return adjusted
 
     def _spectral_features_from_samples(self, samples: np.ndarray) -> np.ndarray:
         frame_size = self.analysis_sample_rate // self.feature_rate
@@ -572,9 +652,13 @@ class AudioMatchingService:
         *,
         require_score: bool = False,
     ) -> AudioSegmentMatch:
+        if abs(match.tempo_factor - 1.0) > 0.01:
+            return match
+
         sample_rate = self.refinement_sample_rate
         reference_start = int(match.reference_start_seconds * sample_rate)
-        reference_end = int((match.reference_start_seconds + match.duration_seconds) * sample_rate)
+        reference_duration = match.reference_duration_seconds or match.duration_seconds
+        reference_end = int((match.reference_start_seconds + reference_duration) * sample_rate)
         reference_segment = reference_samples[reference_start:reference_end]
         if reference_segment.size < sample_rate * self.minimum_segment_seconds:
             if require_score:
@@ -610,8 +694,12 @@ class AudioMatchingService:
         self,
         matches: list[AudioSegmentMatch],
         reference_duration: float,
+        *,
+        best_score: float | None = None,
     ) -> None:
-        covered_duration = sum(match.duration_seconds for match in matches)
+        covered_duration = sum(
+            match.reference_duration_seconds or match.duration_seconds for match in matches
+        )
         required_duration = min(
             reference_duration,
             max(
@@ -621,9 +709,12 @@ class AudioMatchingService:
         )
         if covered_duration < required_duration:
             coverage = covered_duration / reference_duration if reference_duration else 0
+            confidence_detail = (
+                f", melhor confiança {best_score:.0%}" if best_score is not None else ""
+            )
             raise AudioMatchNotFoundError(
                 "Poucos trechos da referência foram confirmados no vídeo original "
-                f"(cobertura {coverage:.0%})."
+                f"(cobertura {coverage:.0%}{confidence_detail})."
             )
 
     @staticmethod
