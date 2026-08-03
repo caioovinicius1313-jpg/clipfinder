@@ -15,6 +15,7 @@ from app.core.database import Base
 from app.main import app
 from app.repositories.generated_clip_repository import GeneratedClipRepository
 from app.services.media_processing_service import (
+    AudioSegmentMatch,
     AudioMatchingService,
     MediaProbe,
     MediaProcessingError,
@@ -157,6 +158,61 @@ def test_spectral_matching_distinguishes_equal_volume_audio() -> None:
     assert score > 0.8
 
 
+def test_real_reencoded_audio_is_located_at_the_correct_time(tmp_path: Path) -> None:
+    media_service = MediaProcessingService()
+    ffmpeg = media_service.get_ffmpeg_executable()
+    source_path = tmp_path / "source.wav"
+    reference_path = tmp_path / "reference.m4a"
+    expected_start_seconds = 9.25
+
+    subprocess.run(
+        [
+            ffmpeg,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "aevalsrc=0.5*sin(2*PI*(180+35*floor(t))*t):s=16000:d=24",
+            "-c:a",
+            "pcm_s16le",
+            str(source_path),
+        ],
+        check=True,
+    )
+    subprocess.run(
+        [
+            ffmpeg,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-ss",
+            str(expected_start_seconds),
+            "-i",
+            str(source_path),
+            "-t",
+            "7",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "96k",
+            str(reference_path),
+        ],
+        check=True,
+    )
+
+    matched_start, duration, score = AudioMatchingService(media_service).find_match(
+        source_path, reference_path
+    )
+
+    assert abs(matched_start - expected_start_seconds) <= 0.2
+    assert 6.8 <= duration <= 7.2
+    assert score >= AudioMatchingService.minimum_score
+
+
 def test_segmented_matching_reconstructs_non_contiguous_reference() -> None:
     import numpy as np
 
@@ -192,6 +248,29 @@ def test_waveform_refinement_finds_precise_offset() -> None:
 
     assert start == expected_start
     assert score > 0.99
+
+
+def test_waveform_refinement_keeps_confirmed_spectral_match_when_audio_was_reencoded() -> None:
+    import numpy as np
+
+    matching_service = AudioMatchingService()
+    generator = np.random.default_rng(31)
+    source_samples = generator.normal(size=80_000)
+    reencoded_reference_samples = generator.normal(size=16_000)
+    spectral_match = AudioSegmentMatch(
+        source_start_seconds=10,
+        reference_start_seconds=0,
+        duration_seconds=4,
+        score=0.8,
+    )
+
+    refined_match = matching_service._refine_segment_match(
+        spectral_match,
+        source_samples,
+        reencoded_reference_samples,
+    )
+
+    assert refined_match == spectral_match
 
 
 def test_audio_extraction_explains_when_file_has_no_audio(monkeypatch: pytest.MonkeyPatch) -> None:

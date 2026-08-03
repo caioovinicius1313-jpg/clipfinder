@@ -337,7 +337,6 @@ class AudioMatchingService:
             match,
             source_samples,
             reference_samples,
-            require_score=True,
         )
         return (
             refined_match.source_start_seconds,
@@ -360,19 +359,14 @@ class AudioMatchingService:
             source_features, reference_features
         )
 
-        refined_matches: list[AudioSegmentMatch] = []
-        for match in matches:
-            try:
-                refined_matches.append(
-                    self._refine_segment_match(
-                        match,
-                        source_samples,
-                        reference_samples,
-                        require_score=True,
-                    )
-                )
-            except AudioMatchNotFoundError:
-                continue
+        refined_matches = [
+            self._refine_segment_match(
+                match,
+                source_samples,
+                reference_samples,
+            )
+            for match in matches
+        ]
 
         reference_duration = reference_samples.size / self.analysis_sample_rate
         self._validate_reference_coverage(refined_matches, reference_duration)
