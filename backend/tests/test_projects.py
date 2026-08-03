@@ -126,6 +126,37 @@ def test_audio_matching_finds_reference_position() -> None:
     assert score > 0.99
 
 
+def test_spectral_matching_distinguishes_equal_volume_audio() -> None:
+    import numpy as np
+
+    matching_service = AudioMatchingService()
+    sample_rate = matching_service.analysis_sample_rate
+    samples_per_tone = sample_rate // 2
+    generator = np.random.default_rng(21)
+    available_frequencies = np.array([120, 240, 480, 820, 1_250, 1_720])
+    frequencies = generator.choice(available_frequencies, size=60)
+    time = np.arange(samples_per_tone) / sample_rate
+    source_samples = np.concatenate(
+        [np.sin(2 * np.pi * frequency * time) for frequency in frequencies]
+    ).astype(np.float32)
+    expected_start_seconds = 10.0
+    reference_samples = source_samples[
+        int(expected_start_seconds * sample_rate) : int(
+            (expected_start_seconds + 8) * sample_rate
+        )
+    ].copy()
+
+    source_features = matching_service._spectral_features_from_samples(source_samples)
+    reference_features = matching_service._spectral_features_from_samples(reference_samples)
+    start_frame, score = matching_service.find_match_in_features(
+        source_features, reference_features
+    )
+
+    matched_start_seconds = start_frame / matching_service.feature_rate
+    assert abs(matched_start_seconds - expected_start_seconds) <= 0.05
+    assert score > 0.8
+
+
 def test_segmented_matching_reconstructs_non_contiguous_reference() -> None:
     import numpy as np
 
@@ -203,7 +234,7 @@ def test_probe_identifies_video_and_audio_streams(monkeypatch: pytest.MonkeyPatc
     )
 
 
-def test_generate_clip_falls_back_when_encoder_exceeds_memory(
+def test_generate_clip_retries_in_1080p_when_full_resolution_exceeds_memory(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     media_service = MediaProcessingService()
@@ -222,16 +253,16 @@ def test_generate_clip_falls_back_when_encoder_exceeds_memory(
 
     monkeypatch.setattr("app.services.media_processing_service.subprocess.run", fake_run)
 
-    mode = media_service.generate_clip(
+    media_service.generate_clip(
         source_path="original.mp4",
         output_path=tmp_path / "clip.mp4",
         start_seconds=10,
         duration_seconds=20,
     )
 
-    assert mode == "copied"
     assert commands[0].index("-threads") < commands[0].index("-i")
-    assert commands[1][commands[1].index("-c") + 1] == "copy"
+    assert commands[1][commands[1].index("-c:v") + 1] == "libx264"
+    assert "scale=1920:1920" in commands[1][commands[1].index("-vf") + 1]
 
 
 def test_failed_clip_error_preserves_the_end() -> None:

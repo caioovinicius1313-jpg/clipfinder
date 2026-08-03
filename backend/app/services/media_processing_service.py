@@ -126,8 +126,47 @@ class MediaProcessingService:
         output_path: Path,
         start_seconds: float,
         duration_seconds: float,
-    ) -> str:
+    ) -> None:
         output_path.parent.mkdir(parents=True, exist_ok=True)
+        result = self._run_precise_clip_encoding(
+            source_path=source_path,
+            output_path=output_path,
+            start_seconds=start_seconds,
+            duration_seconds=duration_seconds,
+            video_filter="pad=ceil(iw/2)*2:ceil(ih/2)*2",
+            crf="18",
+        )
+        if result.returncode == -9:
+            logger.warning(
+                "A codificação na resolução original excedeu a memória; "
+                "repetindo com resolução máxima de 1080p."
+            )
+            output_path.unlink(missing_ok=True)
+            result = self._run_precise_clip_encoding(
+                source_path=source_path,
+                output_path=output_path,
+                start_seconds=start_seconds,
+                duration_seconds=duration_seconds,
+                video_filter=(
+                    "scale=1920:1920:force_original_aspect_ratio=decrease:"
+                    "force_divisible_by=2"
+                ),
+                crf="17",
+            )
+        if result.returncode != 0:
+            detail = self._ffmpeg_error_detail(result)
+            raise MediaProcessingError(f"Não foi possível gerar o corte: {detail}")
+
+    def _run_precise_clip_encoding(
+        self,
+        *,
+        source_path: str | Path,
+        output_path: Path,
+        start_seconds: float,
+        duration_seconds: float,
+        video_filter: str,
+        crf: str,
+    ) -> subprocess.CompletedProcess[bytes]:
         command = [
             self.get_ffmpeg_executable(),
             "-hide_banner",
@@ -156,9 +195,9 @@ class MediaProcessingService:
             "-tune",
             "zerolatency",
             "-crf",
-            "18",
+            crf,
             "-vf",
-            "pad=ceil(iw/2)*2:ceil(ih/2)*2",
+            video_filter,
             "-threads",
             "1",
             "-c:a",
@@ -169,63 +208,7 @@ class MediaProcessingService:
             "+faststart",
             str(output_path),
         ]
-        result = subprocess.run(command, capture_output=True, check=False)
-        if result.returncode == -9:
-            logger.warning(
-                "O encoder excedeu a memória; repetindo o corte sem recodificação."
-            )
-            output_path.unlink(missing_ok=True)
-            self._generate_clip_by_stream_copy(
-                source_path=source_path,
-                output_path=output_path,
-                start_seconds=start_seconds,
-                duration_seconds=duration_seconds,
-            )
-            return "copied"
-        if result.returncode != 0:
-            detail = self._ffmpeg_error_detail(result)
-            raise MediaProcessingError(f"Não foi possível gerar o corte: {detail}")
-        return "encoded"
-
-    def _generate_clip_by_stream_copy(
-        self,
-        *,
-        source_path: str | Path,
-        output_path: Path,
-        start_seconds: float,
-        duration_seconds: float,
-    ) -> None:
-        command = [
-            self.get_ffmpeg_executable(),
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-nostdin",
-            "-y",
-            "-ss",
-            f"{start_seconds:.3f}",
-            "-i",
-            str(source_path),
-            "-t",
-            f"{duration_seconds:.3f}",
-            "-map",
-            "0:v:0?",
-            "-map",
-            "0:a:0?",
-            "-c",
-            "copy",
-            "-avoid_negative_ts",
-            "make_zero",
-            "-movflags",
-            "+faststart",
-            str(output_path),
-        ]
-        result = subprocess.run(command, capture_output=True, check=False)
-        if result.returncode != 0:
-            detail = self._ffmpeg_error_detail(result)
-            raise MediaProcessingError(
-                f"Não foi possível gerar o corte no modo de baixo consumo: {detail}"
-            )
+        return subprocess.run(command, capture_output=True, check=False)
 
     def generate_montage(
         self,
@@ -251,30 +234,15 @@ class MediaProcessingService:
         with tempfile.TemporaryDirectory(prefix="clipfinder-") as temporary_directory:
             temporary_path = Path(temporary_directory)
             part_paths: list[Path] = []
-            part_modes: list[str] = []
             for index, (start_seconds, duration_seconds) in enumerate(segments):
                 part_path = temporary_path / f"part-{index:03d}.mp4"
-                part_modes.append(
-                    self.generate_clip(
-                        source_path=source_path,
-                        output_path=part_path,
-                        start_seconds=start_seconds,
-                        duration_seconds=duration_seconds,
-                    )
+                self.generate_clip(
+                    source_path=source_path,
+                    output_path=part_path,
+                    start_seconds=start_seconds,
+                    duration_seconds=duration_seconds,
                 )
                 part_paths.append(part_path)
-
-            if len(set(part_modes)) > 1:
-                for part_path, (start_seconds, duration_seconds) in zip(
-                    part_paths, segments, strict=True
-                ):
-                    part_path.unlink(missing_ok=True)
-                    self._generate_clip_by_stream_copy(
-                        source_path=source_path,
-                        output_path=part_path,
-                        start_seconds=start_seconds,
-                        duration_seconds=duration_seconds,
-                    )
 
             manifest_path = temporary_path / "parts.txt"
             manifest_path.write_text(
@@ -335,9 +303,13 @@ class AudioMatchingService:
     minimum_segment_score = 0.45
     segment_seconds = 8
     minimum_segment_seconds = 3
-    refinement_sample_rate = 2_000
+    analysis_sample_rate = 4_000
+    feature_rate = 20
+    refinement_sample_rate = analysis_sample_rate
     refinement_search_seconds = 3
     minimum_refinement_score = 0.15
+    minimum_reference_coverage = 0.5
+    spectral_band_edges = (80, 160, 320, 640, 1_000, 1_400, 1_900)
 
     def __init__(self, media_service: MediaProcessingService | None = None) -> None:
         self.media_service = media_service or MediaProcessingService()
@@ -345,29 +317,179 @@ class AudioMatchingService:
     def find_match(
         self, source_path: str | Path, reference_path: str | Path
     ) -> tuple[float, float, float]:
-        source_envelope = self.media_service.extract_audio_envelope(source_path)
-        reference_envelope = self.media_service.extract_audio_envelope(reference_path)
-        start_frame, score = self.find_match_in_envelopes(source_envelope, reference_envelope)
-        duration_seconds = reference_envelope.size / self.media_service.envelope_rate
-        return start_frame / self.media_service.envelope_rate, duration_seconds, score
+        source_samples = self.media_service.extract_audio_samples(
+            source_path, sample_rate=self.analysis_sample_rate
+        )
+        reference_samples = self.media_service.extract_audio_samples(
+            reference_path, sample_rate=self.analysis_sample_rate
+        )
+        source_features = self._spectral_features_from_samples(source_samples)
+        reference_features = self._spectral_features_from_samples(reference_samples)
+        start_frame, score = self.find_match_in_features(source_features, reference_features)
+        duration_seconds = reference_samples.size / self.analysis_sample_rate
+        match = AudioSegmentMatch(
+            source_start_seconds=start_frame / self.feature_rate,
+            reference_start_seconds=0,
+            duration_seconds=duration_seconds,
+            score=score,
+        )
+        refined_match = self._refine_segment_match(
+            match,
+            source_samples,
+            reference_samples,
+            require_score=True,
+        )
+        return (
+            refined_match.source_start_seconds,
+            duration_seconds,
+            refined_match.score,
+        )
 
     def find_segmented_matches(
         self, source_path: str | Path, reference_path: str | Path
     ) -> list[AudioSegmentMatch]:
-        source_envelope = self.media_service.extract_audio_envelope(source_path)
-        reference_envelope = self.media_service.extract_audio_envelope(reference_path)
-        matches = self.find_segmented_matches_in_envelopes(source_envelope, reference_envelope)
-
         source_samples = self.media_service.extract_audio_samples(
-            source_path, sample_rate=self.refinement_sample_rate
+            source_path, sample_rate=self.analysis_sample_rate
         )
         reference_samples = self.media_service.extract_audio_samples(
-            reference_path, sample_rate=self.refinement_sample_rate
+            reference_path, sample_rate=self.analysis_sample_rate
         )
-        return [
-            self._refine_segment_match(match, source_samples, reference_samples)
-            for match in matches
+        source_features = self._spectral_features_from_samples(source_samples)
+        reference_features = self._spectral_features_from_samples(reference_samples)
+        matches = self.find_segmented_matches_in_features(
+            source_features, reference_features
+        )
+
+        refined_matches: list[AudioSegmentMatch] = []
+        for match in matches:
+            try:
+                refined_matches.append(
+                    self._refine_segment_match(
+                        match,
+                        source_samples,
+                        reference_samples,
+                        require_score=True,
+                    )
+                )
+            except AudioMatchNotFoundError:
+                continue
+
+        reference_duration = reference_samples.size / self.analysis_sample_rate
+        self._validate_reference_coverage(refined_matches, reference_duration)
+        return refined_matches
+
+    def find_match_in_features(
+        self, source_features: np.ndarray, reference_features: np.ndarray
+    ) -> tuple[int, float]:
+        if reference_features.shape[0] >= source_features.shape[0]:
+            raise MediaProcessingError("O vídeo de referência precisa ser menor que o vídeo original.")
+
+        best_frame, best_score = self._find_best_match_in_features(
+            source_features, reference_features
+        )
+        if best_score < self.minimum_score:
+            raise AudioMatchNotFoundError(
+                "Nenhum trecho com assinatura de áudio suficientemente parecida foi encontrado "
+                f"(confiança {best_score:.0%})."
+            )
+        return best_frame, best_score
+
+    def find_segmented_matches_in_features(
+        self, source_features: np.ndarray, reference_features: np.ndarray
+    ) -> list[AudioSegmentMatch]:
+        if reference_features.shape[0] >= source_features.shape[0]:
+            raise MediaProcessingError("O vídeo de referência precisa ser menor que o vídeo original.")
+
+        segment_frames = self.segment_seconds * self.feature_rate
+        minimum_frames = self.minimum_segment_seconds * self.feature_rate
+        candidates: list[AudioSegmentMatch] = []
+        for reference_start_frame in range(0, reference_features.shape[0], segment_frames):
+            reference_segment = reference_features[
+                reference_start_frame : reference_start_frame + segment_frames
+            ]
+            if reference_segment.shape[0] < minimum_frames:
+                continue
+
+            source_start_frame, score = self._find_best_match_in_features(
+                source_features, reference_segment
+            )
+            if score >= self.minimum_segment_score:
+                candidates.append(
+                    AudioSegmentMatch(
+                        source_start_seconds=source_start_frame / self.feature_rate,
+                        reference_start_seconds=reference_start_frame / self.feature_rate,
+                        duration_seconds=reference_segment.shape[0] / self.feature_rate,
+                        score=score,
+                    )
+                )
+
+        selected_matches = self._select_chronological_matches(candidates)
+        reference_duration = reference_features.shape[0] / self.feature_rate
+        self._validate_reference_coverage(selected_matches, reference_duration)
+        return selected_matches
+
+    def _spectral_features_from_samples(self, samples: np.ndarray) -> np.ndarray:
+        frame_size = self.analysis_sample_rate // self.feature_rate
+        usable_samples = samples.size - (samples.size % frame_size)
+        if usable_samples < frame_size * self.minimum_segment_seconds * self.feature_rate:
+            raise MediaProcessingError("O vídeo precisa ter pelo menos três segundos de áudio.")
+
+        frames = samples[:usable_samples].reshape(-1, frame_size)
+        window = np.hanning(frame_size).astype(np.float32)
+        frequencies = np.fft.rfftfreq(frame_size, d=1 / self.analysis_sample_rate)
+        band_masks = [
+            (frequencies >= lower_frequency) & (frequencies < upper_frequency)
+            for lower_frequency, upper_frequency in zip(
+                self.spectral_band_edges[:-1],
+                self.spectral_band_edges[1:],
+                strict=True,
+            )
         ]
+        features = np.empty((frames.shape[0], len(band_masks)), dtype=np.float32)
+        chunk_size = 2_048
+        for chunk_start in range(0, frames.shape[0], chunk_size):
+            chunk_end = min(chunk_start + chunk_size, frames.shape[0])
+            spectrum = np.fft.rfft(frames[chunk_start:chunk_end] * window, axis=1)
+            power = np.square(np.abs(spectrum))
+            for band_index, band_mask in enumerate(band_masks):
+                features[chunk_start:chunk_end, band_index] = np.mean(
+                    power[:, band_mask], axis=1
+                )
+
+        log_features = np.log1p(features)
+        spectral_changes = np.diff(log_features, axis=0, prepend=log_features[:1])
+        return np.concatenate((log_features, spectral_changes), axis=1)
+
+    @staticmethod
+    def _find_best_match_in_features(
+        source_features: np.ndarray, reference_features: np.ndarray
+    ) -> tuple[int, float]:
+        source = AudioMatchingService._normalize_columns(source_features)
+        reference = AudioMatchingService._normalize_columns(reference_features)
+        reference_energy = float(np.sum(np.square(reference)))
+        if reference_energy <= 0:
+            raise MediaProcessingError("O áudio do vídeo de referência está silencioso.")
+
+        correlation_size = source.shape[0] + reference.shape[0] - 1
+        fft_size = 1 << (correlation_size - 1).bit_length()
+        source_spectrum = np.fft.rfft(source, fft_size, axis=0)
+        reference_spectrum = np.fft.rfft(reference[::-1], fft_size, axis=0)
+        correlation = np.fft.irfft(
+            np.sum(source_spectrum * reference_spectrum, axis=1), fft_size
+        )
+        valid_correlation = correlation[reference.shape[0] - 1 : source.shape[0]]
+
+        frame_energy = np.sum(np.square(source), axis=1)
+        cumulative_energy = np.concatenate(([0.0], np.cumsum(frame_energy)))
+        source_energy = (
+            cumulative_energy[reference.shape[0] :]
+            - cumulative_energy[: -reference.shape[0]]
+        )
+        scores = valid_correlation / np.sqrt(
+            np.maximum(source_energy * reference_energy, 1e-12)
+        )
+        best_frame = int(np.argmax(scores))
+        return best_frame, float(scores[best_frame])
 
     def find_match_in_envelopes(
         self, source_envelope: np.ndarray, reference_envelope: np.ndarray
@@ -453,12 +575,16 @@ class AudioMatchingService:
         match: AudioSegmentMatch,
         source_samples: np.ndarray,
         reference_samples: np.ndarray,
+        *,
+        require_score: bool = False,
     ) -> AudioSegmentMatch:
         sample_rate = self.refinement_sample_rate
         reference_start = int(match.reference_start_seconds * sample_rate)
         reference_end = int((match.reference_start_seconds + match.duration_seconds) * sample_rate)
         reference_segment = reference_samples[reference_start:reference_end]
         if reference_segment.size < sample_rate * self.minimum_segment_seconds:
+            if require_score:
+                raise AudioMatchNotFoundError("O trecho é curto demais para confirmar a correspondência.")
             return match
 
         padding = self.refinement_search_seconds * sample_rate
@@ -467,17 +593,44 @@ class AudioMatchingService:
         search_end = min(source_samples.size, predicted_start + reference_segment.size + padding)
         source_search_region = source_samples[search_start:search_end]
         if source_search_region.size <= reference_segment.size:
+            if require_score:
+                raise AudioMatchNotFoundError("Não há áudio suficiente para confirmar o trecho encontrado.")
             return match
 
         relative_start, refinement_score = self._find_best_match_in_samples(
             source_search_region, reference_segment
         )
         if refinement_score < self.minimum_refinement_score:
+            if require_score:
+                raise AudioMatchNotFoundError(
+                    "A assinatura espectral parece semelhante, mas a forma de onda não confirmou "
+                    "o trecho com segurança."
+                )
             return match
 
         refined_start = (search_start + relative_start) / sample_rate
         combined_score = (match.score * 0.7) + (refinement_score * 0.3)
         return replace(match, source_start_seconds=refined_start, score=combined_score)
+
+    def _validate_reference_coverage(
+        self,
+        matches: list[AudioSegmentMatch],
+        reference_duration: float,
+    ) -> None:
+        covered_duration = sum(match.duration_seconds for match in matches)
+        required_duration = min(
+            reference_duration,
+            max(
+                float(self.minimum_segment_seconds),
+                reference_duration * self.minimum_reference_coverage,
+            ),
+        )
+        if covered_duration < required_duration:
+            coverage = covered_duration / reference_duration if reference_duration else 0
+            raise AudioMatchNotFoundError(
+                "Poucos trechos da referência foram confirmados no vídeo original "
+                f"(cobertura {coverage:.0%})."
+            )
 
     @staticmethod
     def _find_best_match_in_samples(
@@ -512,7 +665,8 @@ class AudioMatchingService:
         previous_indexes: list[int | None] = [None] * len(candidates)
         for current_index, current in enumerate(candidates):
             for previous_index, previous in enumerate(candidates[:current_index]):
-                if previous.source_start_seconds > current.source_start_seconds:
+                previous_end = previous.source_start_seconds + previous.duration_seconds
+                if previous_end > current.source_start_seconds + 0.25:
                     continue
 
                 weight = best_weights[previous_index] + current.score
@@ -539,3 +693,9 @@ class AudioMatchingService:
         if standard_deviation <= 1e-12:
             return np.zeros_like(centered)
         return centered / standard_deviation
+
+    @staticmethod
+    def _normalize_columns(values: np.ndarray) -> np.ndarray:
+        centered = values - np.mean(values, axis=0, keepdims=True)
+        standard_deviation = np.std(centered, axis=0, keepdims=True)
+        return centered / np.maximum(standard_deviation, 1e-12)
