@@ -3,7 +3,7 @@ import re
 import shutil
 import subprocess
 import tempfile
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -32,6 +32,22 @@ class AudioSegmentMatch:
     score: float
     reference_duration_seconds: float | None = None
     tempo_factor: float = 1.0
+
+
+@dataclass
+class FeatureSearchIndex:
+    normalized_features: np.ndarray
+    cumulative_energy: np.ndarray
+    spectra: dict[int, np.ndarray] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class AudioAnalysis:
+    source_samples: np.ndarray
+    reference_samples: np.ndarray
+    source_features: np.ndarray
+    reference_features: np.ndarray
+    source_search_indexes: tuple[FeatureSearchIndex, FeatureSearchIndex] | None = None
 
 
 @dataclass(frozen=True)
@@ -311,6 +327,8 @@ class AudioMatchingService:
     refinement_search_seconds = 3
     minimum_refinement_score = 0.15
     minimum_reference_coverage = 0.6
+    dtw_search_padding_seconds = 3
+    dtw_step_penalty = 0.05
     spectral_band_edges = (80, 160, 320, 640, 1_000, 1_400, 1_900)
     tempo_factors = (
         0.85,
@@ -334,6 +352,28 @@ class AudioMatchingService:
     def find_match(
         self, source_path: str | Path, reference_path: str | Path
     ) -> tuple[float, float, float]:
+        match = self._find_contiguous_match(self._load_analysis(source_path, reference_path))
+        return match.source_start_seconds, match.duration_seconds, match.score
+
+    def find_segmented_matches(
+        self, source_path: str | Path, reference_path: str | Path
+    ) -> list[AudioSegmentMatch]:
+        return self._find_segmented_matches_from_analysis(
+            self._load_analysis(source_path, reference_path)
+        )
+
+    def find_matches(
+        self, source_path: str | Path, reference_path: str | Path
+    ) -> list[AudioSegmentMatch]:
+        analysis = self._load_analysis(source_path, reference_path)
+        try:
+            return [self._find_contiguous_match(analysis)]
+        except AudioMatchNotFoundError:
+            return self._find_segmented_matches_from_analysis(analysis)
+
+    def _load_analysis(
+        self, source_path: str | Path, reference_path: str | Path
+    ) -> AudioAnalysis:
         source_samples = self.media_service.extract_audio_samples(
             source_path, sample_rate=self.analysis_sample_rate
         )
@@ -342,15 +382,26 @@ class AudioMatchingService:
         )
         source_features = self._spectral_features_from_samples(source_samples)
         reference_features = self._spectral_features_from_samples(reference_samples)
+        return AudioAnalysis(
+            source_samples=source_samples,
+            reference_samples=reference_samples,
+            source_features=source_features,
+            reference_features=reference_features,
+            source_search_indexes=self._build_feature_search_indexes(source_features),
+        )
+
+    def _find_contiguous_match(self, analysis: AudioAnalysis) -> AudioSegmentMatch:
         start_frame, score, tempo_factor = self._find_best_tempo_match(
-            source_features, reference_features
+            analysis.source_features,
+            analysis.reference_features,
+            search_indexes=analysis.source_search_indexes,
         )
         if score < self.minimum_score:
             raise AudioMatchNotFoundError(
                 "Nenhum trecho com assinatura de áudio suficientemente parecida foi encontrado "
                 f"(melhor confiança {score:.0%})."
             )
-        reference_duration_seconds = reference_samples.size / self.analysis_sample_rate
+        reference_duration_seconds = analysis.reference_samples.size / self.analysis_sample_rate
         duration_seconds = reference_duration_seconds * tempo_factor
         match = AudioSegmentMatch(
             source_start_seconds=start_frame / self.feature_rate,
@@ -360,42 +411,44 @@ class AudioMatchingService:
             reference_duration_seconds=reference_duration_seconds,
             tempo_factor=tempo_factor,
         )
-        refined_match = self._refine_segment_match(
+        dtw_match = self._refine_match_with_dtw(
             match,
-            source_samples,
-            reference_samples,
+            analysis.source_features,
+            analysis.reference_features,
         )
-        return (
-            refined_match.source_start_seconds,
-            duration_seconds,
-            refined_match.score,
+        return self._refine_segment_match(
+            dtw_match,
+            analysis.source_samples,
+            analysis.reference_samples,
         )
 
-    def find_segmented_matches(
-        self, source_path: str | Path, reference_path: str | Path
+    def _find_segmented_matches_from_analysis(
+        self, analysis: AudioAnalysis
     ) -> list[AudioSegmentMatch]:
-        source_samples = self.media_service.extract_audio_samples(
-            source_path, sample_rate=self.analysis_sample_rate
-        )
-        reference_samples = self.media_service.extract_audio_samples(
-            reference_path, sample_rate=self.analysis_sample_rate
-        )
-        source_features = self._spectral_features_from_samples(source_samples)
-        reference_features = self._spectral_features_from_samples(reference_samples)
         matches = self.find_segmented_matches_in_features(
-            source_features, reference_features
+            analysis.source_features,
+            analysis.reference_features,
+            search_indexes=analysis.source_search_indexes,
         )
 
-        refined_matches = [
-            self._refine_segment_match(
+        dtw_matches = [
+            self._refine_match_with_dtw(
                 match,
-                source_samples,
-                reference_samples,
+                analysis.source_features,
+                analysis.reference_features,
             )
             for match in matches
         ]
+        refined_matches = [
+            self._refine_segment_match(
+                match,
+                analysis.source_samples,
+                analysis.reference_samples,
+            )
+            for match in dtw_matches
+        ]
 
-        reference_duration = reference_samples.size / self.analysis_sample_rate
+        reference_duration = analysis.reference_samples.size / self.analysis_sample_rate
         self._validate_reference_coverage(refined_matches, reference_duration)
         return refined_matches
 
@@ -416,7 +469,11 @@ class AudioMatchingService:
         return best_frame, best_score
 
     def find_segmented_matches_in_features(
-        self, source_features: np.ndarray, reference_features: np.ndarray
+        self,
+        source_features: np.ndarray,
+        reference_features: np.ndarray,
+        *,
+        search_indexes: tuple[FeatureSearchIndex, FeatureSearchIndex] | None = None,
     ) -> list[AudioSegmentMatch]:
         if reference_features.shape[0] >= source_features.shape[0]:
             raise MediaProcessingError("O vídeo de referência precisa ser menor que o vídeo original.")
@@ -425,6 +482,7 @@ class AudioMatchingService:
         minimum_frames = self.minimum_segment_seconds * self.feature_rate
         candidates: list[AudioSegmentMatch] = []
         best_scores: list[float] = []
+        indexes = search_indexes or self._build_feature_search_indexes(source_features)
         for reference_start_frame in range(0, reference_features.shape[0], segment_frames):
             reference_segment = reference_features[
                 reference_start_frame : reference_start_frame + segment_frames
@@ -433,7 +491,9 @@ class AudioMatchingService:
                 continue
 
             source_start_frame, score, tempo_factor = self._find_best_tempo_match(
-                source_features, reference_segment
+                source_features,
+                reference_segment,
+                search_indexes=indexes,
             )
             best_scores.append(score)
             if score >= self.minimum_segment_score:
@@ -462,7 +522,10 @@ class AudioMatchingService:
         self,
         source_features: np.ndarray,
         reference_features: np.ndarray,
+        *,
+        search_indexes: tuple[FeatureSearchIndex, FeatureSearchIndex] | None = None,
     ) -> tuple[int, float, float]:
+        indexes = search_indexes or self._build_feature_search_indexes(source_features)
         best_frame = 0
         best_score = float("-inf")
         best_tempo_factor = 1.0
@@ -470,8 +533,9 @@ class AudioMatchingService:
             adjusted_reference = self._resample_features(reference_features, tempo_factor)
             if adjusted_reference.shape[0] >= source_features.shape[0]:
                 continue
-            candidate_frame, candidate_score = self._find_best_match_in_features(
-                source_features, adjusted_reference
+            candidate_frame, candidate_score = self._find_best_match_with_indexes(
+                indexes,
+                adjusted_reference,
             )
             logger.debug(
                 "Candidato de tempo %.3f: confiança %.4f no frame %s",
@@ -538,14 +602,44 @@ class AudioMatchingService:
     def _find_best_match_in_features(
         source_features: np.ndarray, reference_features: np.ndarray
     ) -> tuple[int, float]:
-        spectral_scores = AudioMatchingService._feature_match_scores(
-            source_features,
+        indexes = AudioMatchingService._build_feature_search_indexes(source_features)
+        return AudioMatchingService._find_best_match_with_indexes(
+            indexes,
             reference_features,
         )
+
+    @staticmethod
+    def _build_feature_search_indexes(
+        source_features: np.ndarray,
+    ) -> tuple[FeatureSearchIndex, FeatureSearchIndex]:
         source_fingerprint = AudioMatchingService._binary_fingerprint(source_features)
+        return (
+            AudioMatchingService._build_feature_search_index(source_features),
+            AudioMatchingService._build_feature_search_index(source_fingerprint),
+        )
+
+    @staticmethod
+    def _build_feature_search_index(features: np.ndarray) -> FeatureSearchIndex:
+        normalized = AudioMatchingService._normalize_columns(features)
+        frame_energy = np.sum(np.square(normalized), axis=1)
+        return FeatureSearchIndex(
+            normalized_features=normalized,
+            cumulative_energy=np.concatenate(([0.0], np.cumsum(frame_energy))),
+        )
+
+    @staticmethod
+    def _find_best_match_with_indexes(
+        indexes: tuple[FeatureSearchIndex, FeatureSearchIndex],
+        reference_features: np.ndarray,
+    ) -> tuple[int, float]:
+        spectral_index, fingerprint_index = indexes
+        spectral_scores = AudioMatchingService._feature_match_scores(
+            spectral_index,
+            reference_features,
+        )
         reference_fingerprint = AudioMatchingService._binary_fingerprint(reference_features)
         fingerprint_scores = AudioMatchingService._feature_match_scores(
-            source_fingerprint,
+            fingerprint_index,
             reference_fingerprint,
             allow_empty=True,
         )
@@ -569,36 +663,38 @@ class AudioMatchingService:
 
     @staticmethod
     def _feature_match_scores(
-        source_features: np.ndarray,
+        source_index: FeatureSearchIndex,
         reference_features: np.ndarray,
         *,
         allow_empty: bool = False,
     ) -> np.ndarray:
-        source = AudioMatchingService._normalize_columns(source_features)
+        source = source_index.normalized_features
         reference = AudioMatchingService._normalize_columns(reference_features)
         reference_energy = float(np.sum(np.square(reference)))
         if reference_energy <= 0:
             if allow_empty:
                 return np.zeros(
-                    source_features.shape[0] - reference_features.shape[0] + 1,
+                    source.shape[0] - reference.shape[0] + 1,
                     dtype=np.float64,
                 )
             raise MediaProcessingError("O áudio do vídeo de referência está silencioso.")
 
         correlation_size = source.shape[0] + reference.shape[0] - 1
         fft_size = 1 << (correlation_size - 1).bit_length()
-        source_spectrum = np.fft.rfft(source, fft_size, axis=0)
+        source_spectrum = source_index.spectra.get(fft_size)
+        if source_spectrum is None:
+            source_index.spectra.clear()
+            source_spectrum = np.fft.rfft(source, fft_size, axis=0)
+            source_index.spectra[fft_size] = source_spectrum
         reference_spectrum = np.fft.rfft(reference[::-1], fft_size, axis=0)
         correlation = np.fft.irfft(
             np.sum(source_spectrum * reference_spectrum, axis=1), fft_size
         )
         valid_correlation = correlation[reference.shape[0] - 1 : source.shape[0]]
 
-        frame_energy = np.sum(np.square(source), axis=1)
-        cumulative_energy = np.concatenate(([0.0], np.cumsum(frame_energy)))
         source_energy = (
-            cumulative_energy[reference.shape[0] :]
-            - cumulative_energy[: -reference.shape[0]]
+            source_index.cumulative_energy[reference.shape[0] :]
+            - source_index.cumulative_energy[: -reference.shape[0]]
         )
         scores = valid_correlation / np.sqrt(
             np.maximum(source_energy * reference_energy, 1e-12)
@@ -683,6 +779,114 @@ class AudioMatchingService:
         best_score = float(scores[best_frame])
 
         return best_frame, best_score
+
+    def _refine_match_with_dtw(
+        self,
+        match: AudioSegmentMatch,
+        source_features: np.ndarray,
+        reference_features: np.ndarray,
+    ) -> AudioSegmentMatch:
+        reference_duration = match.reference_duration_seconds or match.duration_seconds
+        reference_start_frame = round(match.reference_start_seconds * self.feature_rate)
+        reference_frame_count = max(1, round(reference_duration * self.feature_rate))
+        reference_segment = reference_features[
+            reference_start_frame : reference_start_frame + reference_frame_count
+        ]
+        if reference_segment.shape[0] < self.minimum_segment_seconds * self.feature_rate:
+            return match
+
+        predicted_start_frame = round(match.source_start_seconds * self.feature_rate)
+        expected_source_frames = max(1, round(match.duration_seconds * self.feature_rate))
+        padding_frames = self.dtw_search_padding_seconds * self.feature_rate
+        window_start = max(0, predicted_start_frame - padding_frames)
+        window_end = min(
+            source_features.shape[0],
+            predicted_start_frame + expected_source_frames + padding_frames,
+        )
+        source_window = source_features[window_start:window_end]
+        if source_window.shape[0] < reference_segment.shape[0] // 2:
+            return match
+
+        reference_normalized = self._normalize_feature_rows(
+            self._normalize_columns(reference_segment)
+        )
+        source_normalized = self._normalize_feature_rows(
+            self._normalize_columns(source_window)
+        )
+        similarities = np.clip(
+            reference_normalized @ source_normalized.T,
+            -1.0,
+            1.0,
+        ).astype(np.float32, copy=False)
+        costs = np.subtract(1.0, similarities, dtype=np.float32)
+        reference_frames, source_frames = costs.shape
+        accumulated = np.full(
+            (reference_frames + 1, source_frames + 1),
+            np.inf,
+            dtype=np.float32,
+        )
+        accumulated[0, :] = 0.0
+        steps = np.zeros((reference_frames + 1, source_frames + 1), dtype=np.uint8)
+
+        for reference_index in range(1, reference_frames + 1):
+            for source_index in range(1, source_frames + 1):
+                diagonal = accumulated[reference_index - 1, source_index - 1]
+                vertical = (
+                    accumulated[reference_index - 1, source_index] + self.dtw_step_penalty
+                )
+                horizontal = (
+                    accumulated[reference_index, source_index - 1] + self.dtw_step_penalty
+                )
+                if diagonal <= vertical and diagonal <= horizontal:
+                    previous_cost = diagonal
+                    step = 0
+                elif vertical <= horizontal:
+                    previous_cost = vertical
+                    step = 1
+                else:
+                    previous_cost = horizontal
+                    step = 2
+                accumulated[reference_index, source_index] = (
+                    costs[reference_index - 1, source_index - 1] + previous_cost
+                )
+                steps[reference_index, source_index] = step
+
+        source_index = int(np.argmin(accumulated[reference_frames, 1:])) + 1
+        reference_index = reference_frames
+        path: list[tuple[int, int]] = []
+        while reference_index > 0 and source_index > 0:
+            path.append((reference_index - 1, source_index - 1))
+            step = steps[reference_index, source_index]
+            if step == 0:
+                reference_index -= 1
+                source_index -= 1
+            elif step == 1:
+                reference_index -= 1
+            else:
+                source_index -= 1
+
+        if not path:
+            return match
+
+        source_path_indexes = [item[1] for item in path]
+        refined_start_frame = window_start + min(source_path_indexes)
+        refined_end_frame = window_start + max(source_path_indexes) + 1
+        refined_duration = (refined_end_frame - refined_start_frame) / self.feature_rate
+        refined_tempo_factor = refined_duration / reference_duration
+        if not 0.8 <= refined_tempo_factor <= 1.2:
+            return match
+
+        path_similarity = float(
+            np.mean([similarities[reference, source] for reference, source in path])
+        )
+        combined_score = (match.score * 0.75) + (max(0.0, path_similarity) * 0.25)
+        return replace(
+            match,
+            source_start_seconds=refined_start_frame / self.feature_rate,
+            duration_seconds=refined_duration,
+            score=combined_score,
+            tempo_factor=refined_tempo_factor,
+        )
 
     def _refine_segment_match(
         self,
@@ -824,3 +1028,8 @@ class AudioMatchingService:
         centered = values - np.mean(values, axis=0, keepdims=True)
         standard_deviation = np.std(centered, axis=0, keepdims=True)
         return centered / np.maximum(standard_deviation, 1e-12)
+
+    @staticmethod
+    def _normalize_feature_rows(values: np.ndarray) -> np.ndarray:
+        norms = np.linalg.norm(values, axis=1, keepdims=True)
+        return values / np.maximum(norms, 1e-12)

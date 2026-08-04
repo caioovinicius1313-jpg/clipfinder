@@ -11,7 +11,7 @@ from app.models.source_video import SourceVideo
 from app.repositories.generated_clip_repository import GeneratedClipRepository
 from app.repositories.reference_video_repository import ReferenceVideoRepository
 from app.repositories.source_video_repository import SourceVideoRepository
-from app.services.media_processing_service import AudioMatchNotFoundError, AudioMatchingService
+from app.services.media_processing_service import AudioMatchingService
 from app.services.storage_service import StorageService, StoredFileNotFoundError
 
 
@@ -135,26 +135,14 @@ class MatchingService:
         reference_path: str,
         output_path: Path,
     ) -> tuple[float, float, float]:
-        try:
-            start_seconds, duration_seconds, match_score = self.audio_matching_service.find_match(
-                source_path, reference_path
-            )
-            self.audio_matching_service.media_service.generate_clip(
-                source_path=source_path,
-                output_path=output_path,
-                start_seconds=start_seconds,
-                duration_seconds=duration_seconds,
-            )
-            end_seconds = start_seconds + duration_seconds
-        except AudioMatchNotFoundError:
-            matches = self.audio_matching_service.find_segmented_matches(source_path, reference_path)
-            self.audio_matching_service.media_service.generate_montage(
-                source_path=source_path,
-                output_path=output_path,
-                segments=[(match.source_start_seconds, match.duration_seconds) for match in matches],
-            )
-            start_seconds = matches[0].source_start_seconds
-            end_seconds = matches[-1].source_start_seconds + matches[-1].duration_seconds
-            match_score = sum(match.score for match in matches) / len(matches)
+        matches = self.audio_matching_service.find_matches(source_path, reference_path)
+        self.audio_matching_service.media_service.generate_montage(
+            source_path=source_path,
+            output_path=output_path,
+            segments=[(match.source_start_seconds, match.duration_seconds) for match in matches],
+        )
+        start_seconds = matches[0].source_start_seconds
+        end_seconds = matches[-1].source_start_seconds + matches[-1].duration_seconds
+        match_score = sum(match.score for match in matches) / len(matches)
 
         return start_seconds, end_seconds, match_score

@@ -15,6 +15,7 @@ from app.core.database import Base
 from app.main import app
 from app.repositories.generated_clip_repository import GeneratedClipRepository
 from app.services.media_processing_service import (
+    AudioAnalysis,
     AudioMatchNotFoundError,
     AudioSegmentMatch,
     AudioMatchingService,
@@ -178,6 +179,70 @@ def test_fingerprint_does_not_inflate_unrelated_audio_confidence() -> None:
     assert score < matching_service.minimum_score
 
 
+def test_tempo_search_reuses_source_fft(monkeypatch: pytest.MonkeyPatch) -> None:
+    import numpy as np
+
+    matching_service = AudioMatchingService()
+    generator = np.random.default_rng(72)
+    source_features = generator.normal(size=(1_000, 12))
+    reference_features = source_features[400:560].copy()
+    original_rfft = np.fft.rfft
+    source_fft_calls = 0
+
+    def counted_rfft(values: np.ndarray, *args: object, **kwargs: object) -> np.ndarray:
+        nonlocal source_fft_calls
+        if values.shape == source_features.shape:
+            source_fft_calls += 1
+        return original_rfft(values, *args, **kwargs)
+
+    monkeypatch.setattr(np.fft, "rfft", counted_rfft)
+    matching_service._find_best_tempo_match(source_features, reference_features)
+
+    assert source_fft_calls == 2
+
+
+def test_dtw_refines_locally_variable_speed() -> None:
+    import numpy as np
+
+    matching_service = AudioMatchingService()
+    generator = np.random.default_rng(93)
+    source_features = generator.normal(size=(600, 12))
+    true_start_frame = 200
+    true_end_frame = 380
+    source_segment = source_features[true_start_frame:true_end_frame]
+    first_half = np.linspace(0, 80, 70, endpoint=False)
+    second_half = np.linspace(80, source_segment.shape[0] - 1, 90)
+    warped_positions = np.concatenate((first_half, second_half))
+    reference_features = np.column_stack(
+        [
+            np.interp(
+                warped_positions,
+                np.arange(source_segment.shape[0]),
+                source_segment[:, column],
+            )
+            for column in range(source_segment.shape[1])
+        ]
+    )
+    initial_match = AudioSegmentMatch(
+        source_start_seconds=9.5,
+        reference_start_seconds=0,
+        duration_seconds=9,
+        reference_duration_seconds=8,
+        tempo_factor=1.125,
+        score=0.7,
+    )
+
+    refined = matching_service._refine_match_with_dtw(
+        initial_match,
+        source_features,
+        reference_features,
+    )
+
+    assert abs(refined.source_start_seconds - 10) <= 0.1
+    assert abs(refined.duration_seconds - 9) <= 0.2
+    assert refined.score >= initial_match.score
+
+
 def test_real_reencoded_and_accelerated_audio_is_located_at_correct_time(
     tmp_path: Path,
 ) -> None:
@@ -323,6 +388,43 @@ def test_lower_confidence_blocks_still_require_majority_coverage() -> None:
         )
     )
     matching_service._validate_reference_coverage(matches, reference_duration=32)
+
+
+def test_contiguous_fallback_reuses_the_same_audio_analysis() -> None:
+    import numpy as np
+
+    analysis = AudioAnalysis(
+        source_samples=np.zeros(20_000),
+        reference_samples=np.zeros(4_000),
+        source_features=np.zeros((100, 12)),
+        reference_features=np.zeros((20, 12)),
+    )
+    expected_match = AudioSegmentMatch(
+        source_start_seconds=12,
+        reference_start_seconds=0,
+        duration_seconds=4,
+        score=0.7,
+    )
+
+    class MatchingServiceWithFallback(AudioMatchingService):
+        load_count = 0
+
+        def _load_analysis(self, source_path: str, reference_path: str) -> AudioAnalysis:
+            self.load_count += 1
+            return analysis
+
+        def _find_contiguous_match(self, loaded: AudioAnalysis) -> AudioSegmentMatch:
+            raise AudioMatchNotFoundError("referência editada")
+
+        def _find_segmented_matches_from_analysis(
+            self, loaded: AudioAnalysis
+        ) -> list[AudioSegmentMatch]:
+            return [expected_match]
+
+    matching_service = MatchingServiceWithFallback()
+
+    assert matching_service.find_matches("source.mp4", "reference.mp4") == [expected_match]
+    assert matching_service.load_count == 1
 
 
 def test_audio_extraction_explains_when_file_has_no_audio(monkeypatch: pytest.MonkeyPatch) -> None:
