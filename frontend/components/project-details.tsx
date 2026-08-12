@@ -264,6 +264,12 @@ export function ProjectDetails({ projectId }: ProjectDetailsProps) {
 
   const latestSourceVideo = project.source_videos.at(-1);
   const uploadedReferences = project.reference_videos.filter((reference) => reference.source === "upload");
+  const youtubeReferences = project.reference_videos.filter(
+    (reference) => reference.source === "youtube",
+  );
+  const savedYoutubeIds = new Set(
+    youtubeReferences.map((reference) => reference.external_id).filter(Boolean),
+  );
 
   return (
     <AppShell>
@@ -331,7 +337,51 @@ export function ProjectDetails({ projectId }: ProjectDetailsProps) {
             {isSearchingYoutube ? "Buscando..." : "Buscar"}
           </button>
         </div>
-        {youtubeResults.length > 0 && <div className="mt-6 space-y-3">{youtubeResults.map((result) => <article key={result.video_id} className="rounded-lg border border-slate-200 p-4"><h3 className="font-semibold text-slate-900">{result.title}</h3><p className="mt-1 text-sm text-slate-600">{result.channel_title}</p><div className="mt-4 flex flex-wrap gap-3"><a href={result.url} target="_blank" rel="noreferrer" className="font-medium text-indigo-700">Abrir no YouTube ↗</a><button type="button" onClick={() => handleYoutubeReference(result)} disabled={importingYoutubeId === result.video_id} className="font-semibold text-indigo-700 disabled:text-indigo-300">{importingYoutubeId === result.video_id ? "Salvando..." : "Salvar referência"}</button></div></article>)}</div>}
+        {youtubeReferences.length > 0 && (
+          <div className="mt-6">
+            <h3 className="font-semibold text-slate-900">Links salvos</h3>
+            <div className="mt-3 space-y-3">
+              {youtubeReferences.map((reference) => (
+                <ReferenceCard key={reference.id} reference={reference} />
+              ))}
+            </div>
+          </div>
+        )}
+        {youtubeResults.length > 0 && (
+          <div className="mt-6 space-y-3">
+            {youtubeResults.map((result) => {
+              const isSaved = savedYoutubeIds.has(result.video_id);
+              return (
+                <article key={result.video_id} className="rounded-lg border border-slate-200 p-4">
+                  <h3 className="font-semibold text-slate-900">{result.title}</h3>
+                  <p className="mt-1 text-sm text-slate-600">{result.channel_title}</p>
+                  <div className="mt-4 flex flex-wrap gap-3">
+                    <a
+                      href={result.url}
+                      target="_blank"
+                      rel="noreferrer"
+                      className="font-medium text-indigo-700"
+                    >
+                      Abrir no YouTube ↗
+                    </a>
+                    <button
+                      type="button"
+                      onClick={() => handleYoutubeReference(result)}
+                      disabled={isSaved || importingYoutubeId === result.video_id}
+                      className="font-semibold text-indigo-700 disabled:text-slate-400"
+                    >
+                      {isSaved
+                        ? "Referência salva"
+                        : importingYoutubeId === result.video_id
+                          ? "Salvando..."
+                          : "Salvar referência"}
+                    </button>
+                  </div>
+                </article>
+              );
+            })}
+          </div>
+        )}
       </section>
 
       <section className="mt-6 max-w-3xl rounded-xl border border-slate-200 bg-white p-6 sm:p-8">
