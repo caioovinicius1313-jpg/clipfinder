@@ -143,6 +143,12 @@ class MatchingService:
         )
         start_seconds = matches[0].source_start_seconds
         end_seconds = matches[-1].source_start_seconds + matches[-1].duration_seconds
-        match_score = sum(match.score for match in matches) / len(matches)
+        total_reference_duration = sum(
+            match.reference_duration_seconds or match.duration_seconds for match in matches
+        )
+        match_score = sum(
+            match.score * (match.reference_duration_seconds or match.duration_seconds)
+            for match in matches
+        ) / total_reference_duration
 
         return start_seconds, end_seconds, match_score

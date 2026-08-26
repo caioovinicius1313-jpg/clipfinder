@@ -11,6 +11,15 @@ from app.repositories.reference_video_repository import ReferenceVideoRepository
 from app.schemas.reference_video import YoutubeReferenceCreate
 from app.services.media_processing_service import MediaProcessingService
 from app.services.project_service import ProjectService
+from app.services.storage_service import StorageService
+
+
+class ReferenceVideoNotFoundError(Exception):
+    """Raised when a reference does not belong to the requested project."""
+
+
+class ReferenceVideoInUseError(Exception):
+    """Raised when a reference is currently being processed."""
 
 
 class ReferenceVideoService:
@@ -18,9 +27,11 @@ class ReferenceVideoService:
         self,
         repository: ReferenceVideoRepository | None = None,
         project_service: ProjectService | None = None,
+        storage: StorageService | None = None,
     ) -> None:
         self.repository = repository or ReferenceVideoRepository()
         self.project_service = project_service or ProjectService()
+        self.storage = storage or StorageService()
 
     def upload(
         self, database: Session, *, project_id: uuid.UUID, file: UploadFile
@@ -71,3 +82,36 @@ class ReferenceVideoService:
             thumbnail_url=str(payload.thumbnail_url) if payload.thumbnail_url else None,
             description=payload.description,
         )
+
+    def delete(
+        self,
+        database: Session,
+        *,
+        project_id: uuid.UUID,
+        reference_video_id: uuid.UUID,
+    ) -> None:
+        self.project_service.get_by_id(database, project_id)
+        reference_video = self.repository.get_by_id(
+            database,
+            project_id,
+            reference_video_id,
+        )
+        if reference_video is None:
+            raise ReferenceVideoNotFoundError
+        if any(clip.status == "processing" for clip in reference_video.generated_clips):
+            raise ReferenceVideoInUseError(
+                "Aguarde o processamento terminar antes de excluir esta referência."
+            )
+
+        stored_paths = {
+            path
+            for path in (
+                reference_video.path,
+                *(clip.path for clip in reference_video.generated_clips),
+            )
+            if path
+        }
+        for stored_path in stored_paths:
+            self.storage.delete_object(stored_path)
+
+        self.repository.delete(database, reference_video)

@@ -37,7 +37,11 @@ from app.services.generated_clip_service import (
 from app.services.matching_service import MatchingPrerequisiteError, MatchingService
 from app.services.multipart_upload_service import InvalidUploadError, MultipartUploadService
 from app.services.project_service import ProjectNotFoundError, ProjectService
-from app.services.reference_video_service import ReferenceVideoService
+from app.services.reference_video_service import (
+    ReferenceVideoInUseError,
+    ReferenceVideoNotFoundError,
+    ReferenceVideoService,
+)
 from app.services.source_video_service import SourceVideoService
 from app.services.storage_service import (
     StorageConfigurationError,
@@ -233,6 +237,33 @@ def add_youtube_reference(
         )
     except ProjectNotFoundError as error:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Project not found") from error
+
+
+@router.delete(
+    "/{project_id}/reference-videos/{reference_video_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+)
+def delete_reference_video(
+    project_id: uuid.UUID,
+    reference_video_id: uuid.UUID,
+    database: DatabaseSession,
+) -> Response:
+    try:
+        ReferenceVideoService().delete(
+            database,
+            project_id=project_id,
+            reference_video_id=reference_video_id,
+        )
+        return Response(status_code=status.HTTP_204_NO_CONTENT)
+    except (ProjectNotFoundError, ReferenceVideoNotFoundError) as error:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Referência não encontrada.",
+        ) from error
+    except ReferenceVideoInUseError as error:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(error)) from error
+    except StorageOperationError as error:
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(error)) from error
 
 
 @router.post(

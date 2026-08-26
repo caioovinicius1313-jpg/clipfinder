@@ -1,12 +1,28 @@
 import uuid
 
 from sqlalchemy import select
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, selectinload
 
 from app.models.reference_video import ReferenceVideo
 
 
 class ReferenceVideoRepository:
+    def get_by_id(
+        self,
+        database: Session,
+        project_id: uuid.UUID,
+        reference_video_id: uuid.UUID,
+    ) -> ReferenceVideo | None:
+        statement = (
+            select(ReferenceVideo)
+            .options(selectinload(ReferenceVideo.generated_clips))
+            .where(
+                ReferenceVideo.id == reference_video_id,
+                ReferenceVideo.project_id == project_id,
+            )
+        )
+        return database.scalar(statement)
+
     def list_uploaded(self, database: Session, project_id: uuid.UUID) -> list[ReferenceVideo]:
         statement = (
             select(ReferenceVideo)
@@ -79,3 +95,9 @@ class ReferenceVideoRepository:
         database.commit()
         database.refresh(reference_video)
         return reference_video
+
+    def delete(self, database: Session, reference_video: ReferenceVideo) -> None:
+        for generated_clip in list(reference_video.generated_clips):
+            database.delete(generated_clip)
+        database.delete(reference_video)
+        database.commit()

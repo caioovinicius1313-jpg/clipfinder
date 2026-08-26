@@ -241,6 +241,15 @@ export function addYoutubeReference(
   });
 }
 
+export function deleteReferenceVideo(
+  projectId: string,
+  referenceVideoId: string,
+): Promise<void> {
+  return request<void>(`/projects/${projectId}/reference-videos/${referenceVideoId}`, {
+    method: "DELETE",
+  });
+}
+
 export function generateClips(projectId: string): Promise<{ message: string; jobs_started: number }> {
   return request(`/projects/${projectId}/generated-clips`, { method: "POST" });
 }

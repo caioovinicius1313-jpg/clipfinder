@@ -13,7 +13,13 @@ from app.api.dependencies import get_db
 from app.core.config import settings
 from app.core.database import Base
 from app.main import app
+from app.models.generated_clip import GeneratedClip
+from app.models.project import Project
+from app.models.reference_video import ReferenceVideo
+from app.models.source_video import SourceVideo
 from app.repositories.generated_clip_repository import GeneratedClipRepository
+from app.repositories.reference_video_repository import ReferenceVideoRepository
+from app.schemas.storage import MultipartUploadStart
 from app.services.media_processing_service import (
     AudioAnalysis,
     AudioMatchNotFoundError,
@@ -25,7 +31,6 @@ from app.services.media_processing_service import (
 )
 from app.services.multipart_upload_service import MultipartUploadService
 from app.services.storage_service import StorageService
-from app.schemas.storage import MultipartUploadStart
 
 
 @pytest.fixture()
@@ -113,6 +118,93 @@ def test_create_list_and_upload_source_video(client: TestClient, tmp_path: Path)
     assert not (tmp_path / "storage" / "projects" / project["id"]).exists()
 
 
+def test_delete_uploaded_and_youtube_references(client: TestClient, tmp_path: Path) -> None:
+    project = client.post(
+        "/projects",
+        json={"name": "Referências", "description": "", "hashtag": "#teste"},
+    ).json()
+    uploaded = client.post(
+        f"/projects/{project['id']}/reference-videos/upload",
+        files={"file": ("corte.mp4", b"reference video content", "video/mp4")},
+    ).json()
+    youtube = client.post(
+        f"/projects/{project['id']}/reference-videos/youtube",
+        json={
+            "video_id": "youtube-123",
+            "title": "Corte salvo por engano",
+            "url": "https://www.youtube.com/watch?v=youtube-123",
+        },
+    ).json()
+    uploaded_path = tmp_path / "storage" / uploaded["path"]
+    assert uploaded_path.is_file()
+
+    uploaded_delete = client.delete(
+        f"/projects/{project['id']}/reference-videos/{uploaded['id']}"
+    )
+    youtube_delete = client.delete(
+        f"/projects/{project['id']}/reference-videos/{youtube['id']}"
+    )
+
+    assert uploaded_delete.status_code == 204
+    assert youtube_delete.status_code == 204
+    assert not uploaded_path.exists()
+    assert client.get(f"/projects/{project['id']}").json()["reference_videos"] == []
+    assert (
+        client.delete(f"/projects/{project['id']}/reference-videos/{youtube['id']}").status_code
+        == 404
+    )
+
+
+def test_deleting_reference_also_deletes_its_generated_clips() -> None:
+    engine = create_engine("sqlite+pysqlite://", poolclass=StaticPool)
+    Base.metadata.create_all(bind=engine)
+    database_factory = sessionmaker(bind=engine)
+
+    with database_factory() as database:
+        project = Project(name="Projeto")
+        database.add(project)
+        database.flush()
+        source = SourceVideo(
+            project_id=project.id,
+            filename="original.mp4",
+            path="projects/original.mp4",
+            size=100,
+            status="uploaded",
+        )
+        reference = ReferenceVideo(
+            project_id=project.id,
+            source="upload",
+            title="referencia.mp4",
+            filename="referencia.mp4",
+            path="projects/referencia.mp4",
+            size=50,
+            status="uploaded",
+        )
+        database.add_all((source, reference))
+        database.flush()
+        clip = GeneratedClip(
+            project_id=project.id,
+            source_video_id=source.id,
+            reference_video_id=reference.id,
+            status="failed",
+        )
+        database.add(clip)
+        database.commit()
+        clip_id = clip.id
+
+        loaded_reference = ReferenceVideoRepository().get_by_id(
+            database,
+            project.id,
+            reference.id,
+        )
+        assert loaded_reference is not None
+        ReferenceVideoRepository().delete(database, loaded_reference)
+
+        assert database.get(GeneratedClip, clip_id) is None
+
+    Base.metadata.drop_all(bind=engine)
+
+
 def test_audio_matching_finds_reference_position() -> None:
     import numpy as np
 
@@ -177,6 +269,27 @@ def test_fingerprint_does_not_inflate_unrelated_audio_confidence() -> None:
     )
 
     assert score < matching_service.minimum_score
+
+
+def test_confidence_uses_distance_from_the_second_best_candidate() -> None:
+    import numpy as np
+
+    clear_scores = np.array([0.10, 0.08, 0.40, 0.09, 0.10])
+    ambiguous_scores = np.array([0.39, 0.08, 0.40, 0.09, 0.10])
+
+    clear_confidence = AudioMatchingService._calibrate_match_confidence(
+        clear_scores,
+        best_frame=2,
+        reference_frame_count=1,
+    )
+    ambiguous_confidence = AudioMatchingService._calibrate_match_confidence(
+        ambiguous_scores,
+        best_frame=2,
+        reference_frame_count=1,
+    )
+
+    assert clear_confidence > 0.7
+    assert ambiguous_confidence < AudioMatchingService.minimum_score
 
 
 def test_tempo_search_reuses_source_fft(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -302,6 +415,67 @@ def test_real_reencoded_and_accelerated_audio_is_located_at_correct_time(
     assert score >= AudioMatchingService.minimum_score
 
 
+def test_real_reencoded_audio_starting_between_analysis_frames_has_high_confidence(
+    tmp_path: Path,
+) -> None:
+    media_service = MediaProcessingService()
+    ffmpeg = media_service.get_ffmpeg_executable()
+    source_path = tmp_path / "off-grid-source.wav"
+    reference_path = tmp_path / "off-grid-reference.m4a"
+    expected_start_seconds = 9.273
+
+    subprocess.run(
+        [
+            ffmpeg,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "aevalsrc=0.45*sin(2*PI*(220+90*sin(2*PI*0.7*t))*t)"
+            "+0.2*sin(2*PI*(730+140*sin(2*PI*0.31*t))*t):s=16000:d=24",
+            "-c:a",
+            "pcm_s16le",
+            str(source_path),
+        ],
+        check=True,
+    )
+    subprocess.run(
+        [
+            ffmpeg,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-ss",
+            str(expected_start_seconds),
+            "-t",
+            "8",
+            "-i",
+            str(source_path),
+            "-af",
+            "volume=0.35",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "96k",
+            str(reference_path),
+        ],
+        check=True,
+    )
+
+    matched_start, duration, score = AudioMatchingService(media_service).find_match(
+        source_path,
+        reference_path,
+    )
+
+    assert abs(matched_start - expected_start_seconds) <= 0.15
+    assert 7.8 <= duration <= 8.2
+    assert score >= 0.75
+
+
 def test_segmented_matching_reconstructs_non_contiguous_reference() -> None:
     import numpy as np
 
@@ -360,6 +534,33 @@ def test_waveform_refinement_keeps_confirmed_spectral_match_when_audio_was_reenc
     )
 
     assert refined_match == spectral_match
+
+
+def test_waveform_refinement_does_not_lower_a_confirmed_match(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import numpy as np
+
+    matching_service = AudioMatchingService()
+    spectral_match = AudioSegmentMatch(
+        source_start_seconds=10,
+        reference_start_seconds=0,
+        duration_seconds=4,
+        score=0.8,
+    )
+    monkeypatch.setattr(
+        matching_service,
+        "_find_best_match_in_samples",
+        lambda source, reference: (100, 0.2),
+    )
+
+    refined_match = matching_service._refine_segment_match(
+        spectral_match,
+        np.ones(80_000),
+        np.ones(16_000),
+    )
+
+    assert refined_match.score == spectral_match.score
 
 
 def test_lower_confidence_blocks_still_require_majority_coverage() -> None:

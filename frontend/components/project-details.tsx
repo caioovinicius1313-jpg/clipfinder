@@ -6,6 +6,7 @@ import { ChangeEvent, useEffect, useState } from "react";
 import { AppShell } from "@/components/app-shell";
 import {
   addYoutubeReference,
+  deleteReferenceVideo,
   generateClips,
   generatedClipDownloadUrl,
   getProject,
@@ -86,7 +87,13 @@ function VideoInfo({ video }: { video: Pick<SourceVideo, "filename" | "size" | "
   );
 }
 
-function ReferenceCard({ reference }: { reference: ReferenceVideo }) {
+type ReferenceCardProps = {
+  reference: ReferenceVideo;
+  isDeleting: boolean;
+  onDelete: (reference: ReferenceVideo) => void;
+};
+
+function ReferenceCard({ reference, isDeleting, onDelete }: ReferenceCardProps) {
   return (
     <article className="rounded-lg border border-slate-200 bg-slate-50 p-4 text-sm">
       <div className="flex flex-col gap-1 sm:flex-row sm:items-start sm:justify-between">
@@ -101,16 +108,26 @@ function ReferenceCard({ reference }: { reference: ReferenceVideo }) {
           ? `${formatFileSize(reference.size ?? 0)} · ${formatDuration(reference.duration)}`
           : "Link salvo como referência. Envie o arquivo do corte para usá-lo no matching."}
       </p>
-      {reference.external_url && (
-        <a
-          href={reference.external_url}
-          target="_blank"
-          rel="noreferrer"
-          className="mt-3 inline-block font-medium text-indigo-700 hover:text-indigo-800"
+      <div className="mt-3 flex flex-wrap items-center gap-4">
+        {reference.external_url && (
+          <a
+            href={reference.external_url}
+            target="_blank"
+            rel="noreferrer"
+            className="font-medium text-indigo-700 hover:text-indigo-800"
+          >
+            Abrir no YouTube ↗
+          </a>
+        )}
+        <button
+          type="button"
+          onClick={() => onDelete(reference)}
+          disabled={isDeleting}
+          className="font-semibold text-red-600 hover:text-red-700 disabled:cursor-not-allowed disabled:text-slate-400"
         >
-          Abrir no YouTube ↗
-        </a>
-      )}
+          {isDeleting ? "Excluindo..." : "Excluir referência"}
+        </button>
+      </div>
     </article>
   );
 }
@@ -157,6 +174,7 @@ export function ProjectDetails({ projectId }: ProjectDetailsProps) {
   const [isSearchingYoutube, setIsSearchingYoutube] = useState(false);
   const [isGenerating, setIsGenerating] = useState(false);
   const [importingYoutubeId, setImportingYoutubeId] = useState<string | null>(null);
+  const [deletingReferenceId, setDeletingReferenceId] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
@@ -244,6 +262,29 @@ export function ProjectDetails({ projectId }: ProjectDetailsProps) {
     }
   }
 
+  async function handleDeleteReference(reference: ReferenceVideo) {
+    const confirmed = window.confirm(
+      `Excluir a referência "${reference.title}"? Os cortes gerados a partir dela também serão removidos.`,
+    );
+    if (!confirmed) return;
+
+    clearMessages();
+    setDeletingReferenceId(reference.id);
+    try {
+      await deleteReferenceVideo(projectId, reference.id);
+      await loadProject();
+      setNotice("Referência excluída.");
+    } catch (requestError: unknown) {
+      setError(
+        requestError instanceof Error
+          ? requestError.message
+          : "Não foi possível excluir a referência.",
+      );
+    } finally {
+      setDeletingReferenceId(null);
+    }
+  }
+
   async function handleGenerateClips() {
     clearMessages();
     setIsGenerating(true);
@@ -325,7 +366,18 @@ export function ProjectDetails({ projectId }: ProjectDetailsProps) {
             </div>
           </div>
         )}
-        {uploadedReferences.length > 0 && <div className="mt-6 space-y-3">{uploadedReferences.map((reference) => <ReferenceCard key={reference.id} reference={reference} />)}</div>}
+        {uploadedReferences.length > 0 && (
+          <div className="mt-6 space-y-3">
+            {uploadedReferences.map((reference) => (
+              <ReferenceCard
+                key={reference.id}
+                reference={reference}
+                isDeleting={deletingReferenceId === reference.id}
+                onDelete={handleDeleteReference}
+              />
+            ))}
+          </div>
+        )}
       </section>
 
       <section className="mt-6 max-w-3xl rounded-xl border border-slate-200 bg-white p-6 sm:p-8">
@@ -342,7 +394,12 @@ export function ProjectDetails({ projectId }: ProjectDetailsProps) {
             <h3 className="font-semibold text-slate-900">Links salvos</h3>
             <div className="mt-3 space-y-3">
               {youtubeReferences.map((reference) => (
-                <ReferenceCard key={reference.id} reference={reference} />
+                <ReferenceCard
+                  key={reference.id}
+                  reference={reference}
+                  isDeleting={deletingReferenceId === reference.id}
+                  onDelete={handleDeleteReference}
+                />
               ))}
             </div>
           </div>

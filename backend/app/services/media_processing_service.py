@@ -329,7 +329,11 @@ class AudioMatchingService:
     minimum_reference_coverage = 0.6
     dtw_search_padding_seconds = 3
     dtw_step_penalty = 0.05
-    spectral_band_edges = (80, 160, 320, 640, 1_000, 1_400, 1_900)
+    dtw_tempo_tolerance = 0.03
+    analysis_window_seconds = 0.1
+    mel_band_count = 16
+    minimum_analysis_frequency = 80
+    maximum_analysis_frequency = 1_900
     tempo_factors = (
         0.85,
         0.875,
@@ -567,36 +571,66 @@ class AudioMatchingService:
         return adjusted
 
     def _spectral_features_from_samples(self, samples: np.ndarray) -> np.ndarray:
-        frame_size = self.analysis_sample_rate // self.feature_rate
-        usable_samples = samples.size - (samples.size % frame_size)
-        if usable_samples < frame_size * self.minimum_segment_seconds * self.feature_rate:
+        hop_size = self.analysis_sample_rate // self.feature_rate
+        frame_size = round(self.analysis_sample_rate * self.analysis_window_seconds)
+        minimum_samples = self.analysis_sample_rate * self.minimum_segment_seconds
+        if samples.size < minimum_samples or samples.size < frame_size:
             raise MediaProcessingError("O vídeo precisa ter pelo menos três segundos de áudio.")
 
-        frames = samples[:usable_samples].reshape(-1, frame_size)
+        frames = np.lib.stride_tricks.sliding_window_view(samples, frame_size)[::hop_size]
         window = np.hanning(frame_size).astype(np.float32)
         frequencies = np.fft.rfftfreq(frame_size, d=1 / self.analysis_sample_rate)
-        band_masks = [
-            (frequencies >= lower_frequency) & (frequencies < upper_frequency)
-            for lower_frequency, upper_frequency in zip(
-                self.spectral_band_edges[:-1],
-                self.spectral_band_edges[1:],
-                strict=True,
-            )
-        ]
-        features = np.empty((frames.shape[0], len(band_masks)), dtype=np.float32)
+        mel_filters = self._mel_filter_bank(frequencies)
+        features = np.empty((frames.shape[0], self.mel_band_count), dtype=np.float32)
         chunk_size = 2_048
         for chunk_start in range(0, frames.shape[0], chunk_size):
             chunk_end = min(chunk_start + chunk_size, frames.shape[0])
             spectrum = np.fft.rfft(frames[chunk_start:chunk_end] * window, axis=1)
             power = np.square(np.abs(spectrum))
-            for band_index, band_mask in enumerate(band_masks):
-                features[chunk_start:chunk_end, band_index] = np.mean(
-                    power[:, band_mask], axis=1
-                )
+            features[chunk_start:chunk_end] = power @ mel_filters.T
 
-        log_features = np.log1p(features)
+        log_features = np.log(np.maximum(features, 1e-10))
+        if log_features.shape[0] >= 3:
+            padded = np.pad(log_features, ((1, 1), (0, 0)), mode="edge")
+            log_features = (
+                (padded[:-2] * 0.25) + (padded[1:-1] * 0.5) + (padded[2:] * 0.25)
+            )
         spectral_changes = np.diff(log_features, axis=0, prepend=log_features[:1])
-        return np.concatenate((log_features, spectral_changes), axis=1)
+        return np.concatenate((log_features, spectral_changes), axis=1).astype(np.float32)
+
+    def _mel_filter_bank(self, frequencies: np.ndarray) -> np.ndarray:
+        minimum_mel = self._hertz_to_mel(self.minimum_analysis_frequency)
+        maximum_mel = self._hertz_to_mel(
+            min(self.maximum_analysis_frequency, self.analysis_sample_rate / 2)
+        )
+        mel_points = np.linspace(minimum_mel, maximum_mel, self.mel_band_count + 2)
+        frequency_points = self._mel_to_hertz(mel_points)
+        filters = np.zeros((self.mel_band_count, frequencies.size), dtype=np.float32)
+
+        for band_index, (left, center, right) in enumerate(
+            zip(
+                frequency_points[:-2],
+                frequency_points[1:-1],
+                frequency_points[2:],
+                strict=True,
+            )
+        ):
+            rising = (frequencies - left) / max(center - left, 1e-12)
+            falling = (right - frequencies) / max(right - center, 1e-12)
+            weights = np.maximum(0.0, np.minimum(rising, falling))
+            weight_sum = float(np.sum(weights))
+            if weight_sum > 0:
+                filters[band_index] = weights / weight_sum
+
+        return filters
+
+    @staticmethod
+    def _hertz_to_mel(frequency: float) -> float:
+        return 2_595 * np.log10(1 + (frequency / 700))
+
+    @staticmethod
+    def _mel_to_hertz(mel_values: np.ndarray) -> np.ndarray:
+        return 700 * (np.power(10, mel_values / 2_595) - 1)
 
     @staticmethod
     def _find_best_match_in_features(
@@ -649,7 +683,33 @@ class AudioMatchingService:
             (1.0 - spectral_evidence) * (1.0 - fingerprint_evidence)
         )
         best_frame = int(np.argmax(combined_scores))
-        return best_frame, float(combined_scores[best_frame])
+        confidence = AudioMatchingService._calibrate_match_confidence(
+            combined_scores,
+            best_frame,
+            reference_features.shape[0],
+        )
+        return best_frame, confidence
+
+    @staticmethod
+    def _calibrate_match_confidence(
+        scores: np.ndarray,
+        best_frame: int,
+        reference_frame_count: int,
+    ) -> float:
+        best_score = float(np.clip(scores[best_frame], 0.0, 1.0))
+        exclusion_radius = max(1, reference_frame_count // 2)
+        left_scores = scores[: max(0, best_frame - exclusion_radius)]
+        right_scores = scores[min(scores.size, best_frame + exclusion_radius + 1) :]
+        alternatives = [candidate for candidate in (left_scores, right_scores) if candidate.size]
+        if not alternatives or best_score <= 0:
+            return best_score
+
+        runner_up = max(float(np.max(candidate)) for candidate in alternatives)
+        uniqueness = float(
+            np.clip((best_score - runner_up) / max(best_score, 1e-12), 0.0, 1.0)
+        )
+        evidence_strength = float(np.clip((best_score - 0.2) / 0.25, 0.0, 1.0))
+        return best_score + ((1.0 - best_score) * uniqueness * evidence_strength)
 
     @staticmethod
     def _binary_fingerprint(features: np.ndarray) -> np.ndarray:
@@ -875,11 +935,16 @@ class AudioMatchingService:
         refined_tempo_factor = refined_duration / reference_duration
         if not 0.8 <= refined_tempo_factor <= 1.2:
             return match
+        if abs(refined_tempo_factor - match.tempo_factor) > self.dtw_tempo_tolerance:
+            return match
 
         path_similarity = float(
             np.mean([similarities[reference, source] for reference, source in path])
         )
-        combined_score = (match.score * 0.75) + (max(0.0, path_similarity) * 0.25)
+        combined_score = max(
+            match.score,
+            (match.score * 0.75) + (max(0.0, path_similarity) * 0.25),
+        )
         return replace(
             match,
             source_start_seconds=refined_start_frame / self.feature_rate,
@@ -931,7 +996,10 @@ class AudioMatchingService:
             return match
 
         refined_start = (search_start + relative_start) / sample_rate
-        combined_score = (match.score * 0.7) + (refinement_score * 0.3)
+        combined_score = max(
+            match.score,
+            (match.score * 0.7) + (refinement_score * 0.3),
+        )
         return replace(match, source_start_seconds=refined_start, score=combined_score)
 
     def _validate_reference_coverage(
