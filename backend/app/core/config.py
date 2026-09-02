@@ -16,6 +16,8 @@ class Settings(BaseSettings):
     youtube_ranking_top_limit: int = Field(default=10, ge=1, le=25)
     youtube_ranking_max_hashtags_per_run: int = Field(default=80, ge=1, le=100)
     yt_dlp_timeout_seconds: int = Field(default=60, ge=10, le=180)
+    youtube_cookies_base64: str | None = None
+    youtube_user_agent: str | None = None
     ffmpeg_path: str | None = None
     bucket_name: str | None = Field(
         default=None,

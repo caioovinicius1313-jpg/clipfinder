@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import subprocess
 import uuid
 from collections.abc import Generator
@@ -1015,3 +1016,71 @@ def test_youtube_download_link_is_extracted_on_demand(
     assert url == "https://temporary.googlevideo.com/video.mp4"
     assert "youtube:player_client=default,web_embedded" in captured_command
     assert "--get-url" in captured_command
+
+
+def test_youtube_download_uses_base64_cookies_without_persisting_them(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cookie_contents = (
+        b"# Netscape HTTP Cookie File\n"
+        b".youtube.com\tTRUE\t/\tTRUE\t2147483647\tSID\ttest-value\n"
+    )
+
+    def fake_run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        cookies_index = command.index("--cookies") + 1
+        cookies_path = Path(command[cookies_index])
+        assert cookies_path.is_file()
+        assert cookies_path.read_bytes() == cookie_contents
+        return subprocess.CompletedProcess(
+            args=command,
+            returncode=0,
+            stdout="https://temporary.googlevideo.com/video.mp4\n",
+            stderr="",
+        )
+
+    monkeypatch.setattr(
+        settings,
+        "youtube_cookies_base64",
+        base64.b64encode(cookie_contents).decode("ascii"),
+    )
+    monkeypatch.setattr("app.services.youtube_download_service.subprocess.run", fake_run)
+
+    assert YoutubeDownloadService().get_temporary_download_url("abc123_DEF").startswith("https://")
+
+
+def test_regular_uploads_use_bucket_when_configured(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "bucket_name", "test-bucket")
+    monkeypatch.setattr(settings, "bucket_access_key_id", "test-access")
+    monkeypatch.setattr(settings, "bucket_secret_access_key", "test-secret")
+    monkeypatch.setattr(settings, "bucket_endpoint", "https://storage.example.test")
+
+    def fake_upload_file(
+        storage: StorageService,
+        local_path: Path,
+        *,
+        object_key: str,
+        content_type: str,
+    ) -> str:
+        assert local_path.is_file()
+        assert content_type == "video/mp4"
+        return storage.bucket_path(object_key)
+
+    monkeypatch.setattr(StorageService, "upload_file", fake_upload_file)
+    project = client.post("/projects", json={"name": "Bucket"}).json()
+
+    source = client.post(
+        f"/projects/{project['id']}/upload",
+        files={"file": ("original.mp4", b"source", "video/mp4")},
+    )
+    reference = client.post(
+        f"/projects/{project['id']}/reference-videos/upload",
+        files={"file": ("reference.mp4", b"reference", "video/mp4")},
+    )
+
+    assert source.status_code == 201
+    assert reference.status_code == 201
+    assert source.json()["path"].startswith("bucket://")
+    assert reference.json()["path"].startswith("bucket://")

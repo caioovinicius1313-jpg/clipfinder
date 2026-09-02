@@ -46,6 +46,16 @@ class MatchingService:
         if not reference_videos:
             raise MatchingPrerequisiteError("Envie pelo menos um vídeo de referência antes de gerar cortes.")
 
+        try:
+            self._ensure_stored_file_exists(source_video.path)
+            for reference_video in reference_videos:
+                self._ensure_stored_file_exists(reference_video.path)
+        except StoredFileNotFoundError as error:
+            raise MatchingPrerequisiteError(
+                "Um vídeo enviado não existe mais no armazenamento. Remova a referência antiga "
+                "e envie o arquivo novamente antes de gerar os cortes."
+            ) from error
+
         return [
             self.generated_clip_repository.create(
                 database,
@@ -55,6 +65,13 @@ class MatchingService:
             ).id
             for reference_video in reference_videos
         ]
+
+    def _ensure_stored_file_exists(self, stored_path: str) -> None:
+        if self.storage.is_bucket_path(stored_path):
+            self.storage.object_size(self.storage.object_key(stored_path))
+            return
+        if not self.storage.local_path(stored_path).is_file():
+            raise StoredFileNotFoundError
 
     def process_jobs(self, job_ids: list[uuid.UUID]) -> None:
         for job_id in job_ids:
