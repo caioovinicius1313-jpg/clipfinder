@@ -28,6 +28,11 @@ DATABASE_URL=${{Postgres.DATABASE_URL}}
 STORAGE_PATH=/app/storage
 CORS_ORIGINS=https://SEU-FRONTEND.vercel.app,http://localhost:3000
 YOUTUBE_API_KEY=
+YOUTUBE_RANKING_METRIC=view_delta
+YOUTUBE_RANKING_CANDIDATE_LIMIT=25
+YOUTUBE_RANKING_TOP_LIMIT=10
+YOUTUBE_RANKING_MAX_HASHTAGS_PER_RUN=80
+YT_DLP_TIMEOUT_SECONDS=60
 ```
 
 ## Railway Bucket para vídeos grandes
@@ -93,6 +98,24 @@ NEXT_PUBLIC_API_URL=https://SEU-BACKEND.up.railway.app
 
 6. Publique o projeto.
 7. Volte à Railway e coloque o endereço final da Vercel em `CORS_ORIGINS`.
+
+## Job diário do ranking de hashtags
+
+Depois que o backend estiver funcionando, crie um segundo serviço Railway a partir do mesmo repositório:
+
+- **Nome:** `hashtag-ranking-cron`
+- **Root Directory:** `/backend`
+- **Config File Path:** `/backend/railway-ranking-cron.json`
+- **Cron Schedule:** `0 9 * * *`
+
+Adicione pelo menos:
+
+```env
+DATABASE_URL=${{Postgres.DATABASE_URL}}
+YOUTUBE_API_KEY=${{clipfinder.YOUTUBE_API_KEY}}
+```
+
+Esse serviço não recebe tráfego público e encerra após cada snapshot. O procedimento detalhado está em [`HASHTAG_RANKING.md`](HASHTAG_RANKING.md).
 
 ## Verificação
 

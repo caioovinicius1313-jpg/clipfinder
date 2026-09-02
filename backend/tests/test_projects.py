@@ -1,6 +1,8 @@
+import asyncio
 import subprocess
 import uuid
 from collections.abc import Generator
+from datetime import date, timedelta
 from pathlib import Path
 
 import pytest
@@ -14,12 +16,16 @@ from app.core.config import settings
 from app.core.database import Base
 from app.main import app
 from app.models.generated_clip import GeneratedClip
+from app.models.hashtag_video_daily_stat import HashtagVideoDailyStat
 from app.models.project import Project
 from app.models.reference_video import ReferenceVideo
 from app.models.source_video import SourceVideo
 from app.repositories.generated_clip_repository import GeneratedClipRepository
+from app.repositories.hashtag_video_daily_stat_repository import HashtagVideoDailyStatRepository
 from app.repositories.reference_video_repository import ReferenceVideoRepository
 from app.schemas.storage import MultipartUploadStart
+from app.schemas.youtube import YoutubeRankingMetric, YoutubeVideoDetails
+from app.services.hashtag_ranking_service import HashtagRankingService
 from app.services.media_processing_service import (
     AudioAnalysis,
     AudioMatchNotFoundError,
@@ -31,6 +37,7 @@ from app.services.media_processing_service import (
 )
 from app.services.multipart_upload_service import MultipartUploadService
 from app.services.storage_service import StorageService
+from app.services.youtube_download_service import YoutubeDownloadService
 
 
 @pytest.fixture()
@@ -75,6 +82,17 @@ def test_create_list_and_upload_source_video(client: TestClient, tmp_path: Path)
     list_response = client.get("/projects")
     assert list_response.status_code == 200
     assert [item["id"] for item in list_response.json()] == [project["id"]]
+
+    ranking_response = client.get(
+        f"/projects/{project['id']}/youtube/ranking?metric=view_delta"
+    )
+    assert ranking_response.status_code == 200
+    assert ranking_response.json() == {
+        "hashtag": "#podcast",
+        "snapshot_date": None,
+        "metric": "view_delta",
+        "videos": [],
+    }
 
     upload_response = client.post(
         f"/projects/{project['id']}/upload",
@@ -749,3 +767,151 @@ def test_storage_service_formats_bucket_paths() -> None:
     assert stored_path == "bucket://projects/example/video.mp4"
     assert StorageService.is_bucket_path(stored_path)
     assert StorageService.object_key(stored_path) == "projects/example/video.mp4"
+
+
+def test_daily_hashtag_ranking_calculates_delta_and_reuses_same_search() -> None:
+    engine = create_engine("sqlite+pysqlite://", poolclass=StaticPool)
+    Base.metadata.create_all(bind=engine)
+    database_factory = sessionmaker(bind=engine, autocommit=False, autoflush=False)
+    target_date = date(2026, 9, 2)
+
+    class FakeYoutubeService:
+        calls = 0
+
+        async def search_hashtag_statistics(
+            self,
+            hashtag: str,
+            *,
+            limit: int,
+            carryover_video_ids: object = (),
+        ) -> list[YoutubeVideoDetails]:
+            self.calls += 1
+            assert hashtag == "#podcast"
+            assert limit >= 1
+            return [
+                YoutubeVideoDetails(
+                    video_id="video-123",
+                    title="Corte em alta",
+                    channel_title="Canal",
+                    thumbnail_url="https://i.ytimg.com/vi/video-123/hqdefault.jpg",
+                    published_at=None,
+                    views=1_450,
+                )
+            ]
+
+    fake_youtube = FakeYoutubeService()
+    with database_factory() as database:
+        projects = [
+            Project(name="Projeto A", hashtag="#podcast"),
+            Project(name="Projeto B", hashtag="podcast"),
+        ]
+        database.add_all(projects)
+        database.flush()
+        database.add_all(
+            [
+                HashtagVideoDailyStat(
+                    project_id=project.id,
+                    hashtag="#podcast",
+                    video_id="video-123",
+                    snapshot_date=target_date - timedelta(days=1),
+                    title="Corte em alta",
+                    channel_title="Canal",
+                    views=1_000,
+                )
+                for project in projects
+            ]
+        )
+        database.commit()
+        project_ids = [project.id for project in projects]
+
+        result = asyncio.run(
+            HashtagRankingService(youtube=fake_youtube).sync_all(
+                database,
+                snapshot_date=target_date,
+            )
+        )
+
+        assert fake_youtube.calls == 1
+        assert result.projects_updated == 2
+        for project_id in project_ids:
+            stats = HashtagVideoDailyStatRepository().list_for_date(
+                database,
+                project_id,
+                target_date,
+                metric="view_delta",
+                limit=10,
+            )
+            assert len(stats) == 1
+            assert stats[0].view_delta == 450
+
+    Base.metadata.drop_all(bind=engine)
+
+
+def test_ranking_uses_total_views_as_configurable_metric() -> None:
+    engine = create_engine("sqlite+pysqlite://", poolclass=StaticPool)
+    Base.metadata.create_all(bind=engine)
+    database_factory = sessionmaker(bind=engine, autocommit=False, autoflush=False)
+
+    with database_factory() as database:
+        project = Project(name="Projeto", hashtag="#clips")
+        database.add(project)
+        database.flush()
+        database.add_all(
+            [
+                HashtagVideoDailyStat(
+                    project_id=project.id,
+                    hashtag="#clips",
+                    video_id="older-hit",
+                    snapshot_date=date(2026, 9, 2),
+                    title="Mais visto",
+                    channel_title="Canal A",
+                    views=50_000,
+                    view_delta=100,
+                ),
+                HashtagVideoDailyStat(
+                    project_id=project.id,
+                    hashtag="#clips",
+                    video_id="trending-now",
+                    snapshot_date=date(2026, 9, 2),
+                    title="Em alta",
+                    channel_title="Canal B",
+                    views=10_000,
+                    view_delta=5_000,
+                ),
+            ]
+        )
+        database.commit()
+
+        ranking = HashtagRankingService().list_for_project(
+            database,
+            project_id=project.id,
+            metric=YoutubeRankingMetric.views,
+            limit=10,
+        )
+
+        assert [video.video_id for video in ranking.videos] == ["older-hit", "trending-now"]
+
+    Base.metadata.drop_all(bind=engine)
+
+
+def test_youtube_download_link_is_extracted_on_demand(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured_command: list[str] = []
+
+    def fake_run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        captured_command.extend(command)
+        return subprocess.CompletedProcess(
+            args=command,
+            returncode=0,
+            stdout="https://temporary.googlevideo.com/video.mp4\n",
+            stderr="",
+        )
+
+    monkeypatch.setattr("app.services.youtube_download_service.subprocess.run", fake_run)
+
+    url = YoutubeDownloadService().get_temporary_download_url("abc123_DEF")
+
+    assert url == "https://temporary.googlevideo.com/video.mp4"
+    assert "youtube:player_client=default,web_embedded" in captured_command
+    assert "--get-url" in captured_command

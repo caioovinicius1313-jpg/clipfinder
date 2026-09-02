@@ -1,4 +1,5 @@
 from functools import lru_cache
+from typing import Literal
 
 from pydantic import AliasChoices, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -10,6 +11,11 @@ class Settings(BaseSettings):
     storage_path: str = "/app/storage"
     cors_origins: str = "http://localhost:3000"
     youtube_api_key: str | None = None
+    youtube_ranking_metric: Literal["views", "view_delta"] = "view_delta"
+    youtube_ranking_candidate_limit: int = Field(default=25, ge=5, le=25)
+    youtube_ranking_top_limit: int = Field(default=10, ge=1, le=25)
+    youtube_ranking_max_hashtags_per_run: int = Field(default=80, ge=1, le=100)
+    yt_dlp_timeout_seconds: int = Field(default=60, ge=10, le=180)
     ffmpeg_path: str | None = None
     bucket_name: str | None = Field(
         default=None,

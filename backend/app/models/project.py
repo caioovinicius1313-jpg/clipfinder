@@ -9,6 +9,7 @@ from app.core.database import Base
 
 if TYPE_CHECKING:
     from app.models.generated_clip import GeneratedClip
+    from app.models.hashtag_video_daily_stat import HashtagVideoDailyStat
     from app.models.reference_video import ReferenceVideo
     from app.models.source_video import SourceVideo
 
@@ -31,5 +32,8 @@ class Project(Base):
         back_populates="project", cascade="all, delete-orphan"
     )
     generated_clips: Mapped[list["GeneratedClip"]] = relationship(
+        back_populates="project", cascade="all, delete-orphan"
+    )
+    hashtag_video_daily_stats: Mapped[list["HashtagVideoDailyStat"]] = relationship(
         back_populates="project", cascade="all, delete-orphan"
     )

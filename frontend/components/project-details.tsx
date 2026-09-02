@@ -4,6 +4,7 @@ import Link from "next/link";
 import { ChangeEvent, useEffect, useState } from "react";
 
 import { AppShell } from "@/components/app-shell";
+import { HashtagRankingSection } from "@/components/hashtag-ranking";
 import {
   addYoutubeReference,
   deleteReferenceVideo,
@@ -330,7 +331,9 @@ export function ProjectDetails({ projectId }: ProjectDetailsProps) {
         </div>
       )}
 
-      <section className="mt-8 max-w-3xl rounded-xl border border-slate-200 bg-white p-6 sm:p-8">
+      <HashtagRankingSection projectId={projectId} hashtag={project.hashtag} />
+
+      <section className="mt-6 max-w-3xl rounded-xl border border-slate-200 bg-white p-6 sm:p-8">
         <h2 className="text-xl font-bold text-slate-900">Vídeo original</h2>
         <p className="mt-2 text-slate-600">Envie o vídeo completo que será usado para gerar os cortes.</p>
         <input type="file" accept="video/*" onChange={(event) => setSelectedSourceFile(event.target.files?.[0] ?? null)} className="mt-6 block w-full cursor-pointer rounded-lg border border-slate-300 p-2 text-sm text-slate-700" />

@@ -10,11 +10,14 @@ ClipFinder organiza um vídeo original, referências de cortes e os clipes encon
 - Enviar vídeos grandes em partes para um Railway Bucket, quando configurado.
 - Enviar arquivos de vídeo que servem como referências de corte.
 - Buscar vídeos no YouTube por palavra-chave e salvar seus links como referência do projeto.
+- Criar um ranking diário dos vídeos de cada hashtag por crescimento em 24h ou views totais.
+- Manter snapshots históricos para calcular tendências sem perder os dias anteriores.
+- Gerar um link temporário de download com yt-dlp somente quando o usuário solicitar.
 - Comparar o áudio das referências enviadas com o vídeo original.
 - Gerar e baixar os cortes que forem encontrados.
 - Visualizar e testar a API pelo Swagger.
 
-> A busca do YouTube encontra e registra links. Para gerar um corte, envie também o arquivo de vídeo de referência. O aplicativo não baixa vídeos de terceiros.
+> A busca do YouTube encontra e registra links. Para gerar um corte, envie também o arquivo de vídeo de referência. O download apresentado no ranking deve ser usado somente em vídeos que você tem autorização para baixar.
 
 ## Tecnologias
 
@@ -88,6 +91,19 @@ YOUTUBE_API_KEY=sua_chave_aqui
 
 Depois feche as duas janelas abertas e execute ` .\start-local.ps1` novamente. Sem a chave, o restante do sistema continua funcionando normalmente, mas a busca do YouTube informa que falta a configuração.
 
+### Ranking diário por hashtag
+
+O ranking usa `view_delta` como padrão: compara o total atual com o snapshot do dia anterior e mostra quais vídeos ganharam mais views nas últimas 24 horas. No painel também é possível alternar para o total acumulado de views.
+
+Para executar o snapshot manualmente no computador:
+
+```powershell
+cd C:\Users\Lenovo\Downloads\Clipfinder\backend
+.\.venv\Scripts\python.exe -m app.jobs.sync_hashtag_rankings
+```
+
+O primeiro snapshot ainda não possui comparação. Os valores de crescimento aparecem após a execução do dia seguinte. A configuração completa do job na Railway está em [`docs/HASHTAG_RANKING.md`](docs/HASHTAG_RANKING.md).
+
 ## API disponível
 
 | Método | Rota | Finalidade |
@@ -103,6 +119,8 @@ Depois feche as duas janelas abertas e execute ` .\start-local.ps1` novamente. S
 | `POST` | `/projects/{id}/uploads/multipart/complete` | Conclui e registra o arquivo |
 | `POST` | `/projects/{id}/uploads/multipart/abort` | Cancela um upload incompleto |
 | `GET` | `/projects/{id}/youtube/search` | Busca vídeos no YouTube |
+| `GET` | `/projects/{id}/youtube/ranking` | Lista o ranking diário por `views` ou `view_delta` |
+| `GET` | `/projects/{id}/youtube/ranking/{stat_id}/download` | Extrai e redireciona para um link temporário de download |
 | `POST` | `/projects/{id}/reference-videos/youtube` | Salva um link do YouTube como referência |
 | `POST` | `/projects/{id}/generated-clips` | Inicia a geração de cortes |
 | `GET` | `/projects/{id}/generated-clips/{clip_id}/download` | Baixa um corte concluído |
@@ -121,4 +139,4 @@ O passo a passo para publicar o frontend na Vercel e o backend, PostgreSQL e arm
 
 ## Limitações atuais
 
-Ainda não há Whisper, transcrição, IA semântica, TikTok, Celery ou download de vídeos de plataformas. O matching atual é intencionalmente simples e local: usa a semelhança do áudio para encontrar referências que pertencem ao vídeo original.
+Ainda não há Whisper, transcrição, IA semântica, TikTok ou Celery. O matching atual usa a semelhança do áudio para encontrar referências que pertencem ao vídeo original. Links diretos extraídos do YouTube não são permanentes e não são armazenados no banco.

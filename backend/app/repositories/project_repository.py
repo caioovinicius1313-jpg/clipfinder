@@ -23,6 +23,14 @@ class ProjectRepository:
         statement = select(Project).order_by(Project.created_at.desc())
         return list(database.scalars(statement))
 
+    def list_with_hashtag(self, database: Session) -> list[Project]:
+        statement = (
+            select(Project)
+            .where(Project.hashtag.is_not(None), Project.hashtag != "")
+            .order_by(Project.created_at.asc())
+        )
+        return list(database.scalars(statement))
+
     def create(
         self,
         database: Session,

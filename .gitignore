@@ -5,6 +5,7 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 backend/.pytest-tmp-*/
+backend/.pytest-ranking-*/
 backend/.test-temp/
 .pnpm-store/
 .ruff_cache/
@@ -13,6 +14,7 @@ backend/.test-temp/
 frontend/node_modules/
 frontend/.next/
 frontend/out/
+frontend/*.tsbuildinfo
 
 # User-uploaded files (the directory itself is retained)
 storage/*

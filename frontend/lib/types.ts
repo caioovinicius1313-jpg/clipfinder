@@ -59,6 +59,28 @@ export type YoutubeSearchResult = {
   published_at: string | null;
 };
 
+export type YoutubeRankingMetric = "views" | "view_delta";
+
+export type HashtagRankingVideo = {
+  id: string;
+  video_id: string;
+  title: string;
+  channel_title: string;
+  thumbnail_url: string | null;
+  published_at: string | null;
+  views: number;
+  view_delta: number | null;
+  snapshot_date: string;
+  youtube_url: string;
+};
+
+export type HashtagRanking = {
+  hashtag: string | null;
+  snapshot_date: string | null;
+  metric: YoutubeRankingMetric;
+  videos: HashtagRankingVideo[];
+};
+
 export type ProjectDetail = Project & {
   source_videos: SourceVideo[];
   reference_videos: ReferenceVideo[];

@@ -29,10 +29,18 @@ from app.schemas.storage import (
     MultipartUploadStart,
     MultipartUploadStartResponse,
 )
-from app.schemas.youtube import YoutubeSearchResult
+from app.schemas.youtube import (
+    HashtagRankingRead,
+    YoutubeRankingMetric,
+    YoutubeSearchResult,
+)
 from app.services.generated_clip_service import (
     GeneratedClipNotAvailableError,
     GeneratedClipService,
+)
+from app.services.hashtag_ranking_service import (
+    HashtagRankingNotFoundError,
+    HashtagRankingService,
 )
 from app.services.matching_service import MatchingPrerequisiteError, MatchingService
 from app.services.multipart_upload_service import InvalidUploadError, MultipartUploadService
@@ -48,7 +56,12 @@ from app.services.storage_service import (
     StorageOperationError,
     StoredFileNotFoundError,
 )
-from app.services.youtube_service import YoutubeConfigurationError, YoutubeRequestError, YoutubeService
+from app.services.youtube_download_service import YoutubeDownloadError
+from app.services.youtube_service import (
+    YoutubeConfigurationError,
+    YoutubeRequestError,
+    YoutubeService,
+)
 
 router = APIRouter(prefix="/projects", tags=["projects"])
 
@@ -218,6 +231,46 @@ async def search_youtube_videos(
     except YoutubeConfigurationError as error:
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(error)) from error
     except YoutubeRequestError as error:
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(error)) from error
+
+
+@router.get("/{project_id}/youtube/ranking", response_model=HashtagRankingRead)
+def get_hashtag_ranking(
+    project_id: uuid.UUID,
+    database: DatabaseSession,
+    metric: Annotated[YoutubeRankingMetric | None, Query()] = None,
+    limit: Annotated[int | None, Query(ge=1, le=25)] = None,
+) -> HashtagRankingRead:
+    try:
+        return HashtagRankingService().list_for_project(
+            database,
+            project_id=project_id,
+            metric=metric,
+            limit=limit,
+        )
+    except ProjectNotFoundError as error:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Project not found") from error
+
+
+@router.get("/{project_id}/youtube/ranking/{stat_id}/download")
+def download_ranked_youtube_video(
+    project_id: uuid.UUID,
+    stat_id: uuid.UUID,
+    database: DatabaseSession,
+) -> Response:
+    try:
+        direct_url = HashtagRankingService().get_download_url(
+            database,
+            project_id=project_id,
+            stat_id=stat_id,
+        )
+        return RedirectResponse(direct_url, status_code=status.HTTP_307_TEMPORARY_REDIRECT)
+    except (ProjectNotFoundError, HashtagRankingNotFoundError) as error:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Vídeo do ranking não encontrado.",
+        ) from error
+    except YoutubeDownloadError as error:
         raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(error)) from error
 
 

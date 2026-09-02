@@ -1,11 +1,13 @@
 import type {
   GeneratedClip,
+  HashtagRanking,
   Project,
   ProjectDetail,
   ProjectInput,
   ReferenceVideo,
   SourceVideo,
   YoutubeSearchResult,
+  YoutubeRankingMetric,
 } from "@/lib/types";
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
@@ -221,6 +223,19 @@ export async function uploadReferenceVideo(
 
 export function searchYoutube(projectId: string, query: string): Promise<YoutubeSearchResult[]> {
   return request<YoutubeSearchResult[]>(`/projects/${projectId}/youtube/search?query=${encodeURIComponent(query)}`);
+}
+
+export function getHashtagRanking(
+  projectId: string,
+  metric: YoutubeRankingMetric,
+): Promise<HashtagRanking> {
+  return request<HashtagRanking>(
+    `/projects/${projectId}/youtube/ranking?metric=${encodeURIComponent(metric)}`,
+  );
+}
+
+export function hashtagRankingDownloadUrl(projectId: string, statId: string): string {
+  return `${API_URL}/projects/${projectId}/youtube/ranking/${statId}/download`;
 }
 
 export function addYoutubeReference(
