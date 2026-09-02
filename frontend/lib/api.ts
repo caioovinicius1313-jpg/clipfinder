@@ -1,6 +1,7 @@
 import type {
   GeneratedClip,
   HashtagRanking,
+  HashtagWeeklyRanking,
   Project,
   ProjectDetail,
   ProjectInput,
@@ -236,6 +237,16 @@ export function getHashtagRanking(
 
 export function hashtagRankingDownloadUrl(projectId: string, statId: string): string {
   return `${API_URL}/projects/${projectId}/youtube/ranking/${statId}/download`;
+}
+
+export function refreshHashtagRanking(projectId: string): Promise<HashtagRanking> {
+  return request<HashtagRanking>(`/projects/${projectId}/youtube/ranking/refresh`, {
+    method: "POST",
+  });
+}
+
+export function getWeeklyHashtagRanking(projectId: string): Promise<HashtagWeeklyRanking> {
+  return request<HashtagWeeklyRanking>(`/projects/${projectId}/youtube/ranking/weekly`);
 }
 
 export function addYoutubeReference(

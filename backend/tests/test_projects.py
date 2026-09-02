@@ -894,6 +894,106 @@ def test_ranking_uses_total_views_as_configurable_metric() -> None:
     Base.metadata.drop_all(bind=engine)
 
 
+def test_manual_ranking_refresh_updates_only_requested_project() -> None:
+    engine = create_engine("sqlite+pysqlite://", poolclass=StaticPool)
+    Base.metadata.create_all(bind=engine)
+    database_factory = sessionmaker(bind=engine, autocommit=False, autoflush=False)
+
+    class FakeYoutubeService:
+        calls = 0
+
+        async def search_hashtag_statistics(
+            self,
+            hashtag: str,
+            *,
+            limit: int,
+            carryover_video_ids: object = (),
+        ) -> list[YoutubeVideoDetails]:
+            self.calls += 1
+            assert hashtag == "#clips"
+            return [
+                YoutubeVideoDetails(
+                    video_id="manual-refresh",
+                    title="Atualizado agora",
+                    channel_title="Canal",
+                    thumbnail_url=None,
+                    published_at=None,
+                    views=2_500,
+                )
+            ]
+
+    fake_youtube = FakeYoutubeService()
+    with database_factory() as database:
+        project = Project(name="Projeto", hashtag="#clips")
+        untouched = Project(name="Outro", hashtag="#outro")
+        database.add_all([project, untouched])
+        database.commit()
+
+        ranking = asyncio.run(
+            HashtagRankingService(youtube=fake_youtube).sync_project(
+                database,
+                project_id=project.id,
+                snapshot_date=date(2026, 9, 2),
+            )
+        )
+
+        assert fake_youtube.calls == 1
+        assert [video.video_id for video in ranking.videos] == ["manual-refresh"]
+        assert HashtagVideoDailyStatRepository().latest_date(database, untouched.id) is None
+
+    Base.metadata.drop_all(bind=engine)
+
+
+def test_weekly_ranking_returns_top_three_by_view_growth() -> None:
+    engine = create_engine("sqlite+pysqlite://", poolclass=StaticPool)
+    Base.metadata.create_all(bind=engine)
+    database_factory = sessionmaker(bind=engine, autocommit=False, autoflush=False)
+
+    with database_factory() as database:
+        project = Project(name="Projeto", hashtag="#clips")
+        database.add(project)
+        database.flush()
+        start = date(2026, 8, 27)
+        end = date(2026, 9, 2)
+        growth_by_video = {"a": 100, "b": 900, "c": 300, "d": 500}
+        for video_id, growth in growth_by_video.items():
+            database.add_all(
+                [
+                    HashtagVideoDailyStat(
+                        project_id=project.id,
+                        hashtag="#clips",
+                        video_id=video_id,
+                        snapshot_date=start,
+                        title=f"Vídeo {video_id}",
+                        channel_title="Canal",
+                        views=1_000,
+                    ),
+                    HashtagVideoDailyStat(
+                        project_id=project.id,
+                        hashtag="#clips",
+                        video_id=video_id,
+                        snapshot_date=end,
+                        title=f"Vídeo {video_id}",
+                        channel_title="Canal",
+                        views=1_000 + growth,
+                    ),
+                ]
+            )
+        database.commit()
+
+        ranking = HashtagRankingService().list_weekly_for_project(
+            database,
+            project_id=project.id,
+        )
+
+        assert ranking.period_start == start
+        assert ranking.period_end == end
+        assert [video.video_id for video in ranking.videos] == ["b", "d", "c"]
+        assert [video.weekly_view_delta for video in ranking.videos] == [900, 500, 300]
+
+    Base.metadata.drop_all(bind=engine)
+
+
 def test_youtube_download_link_is_extracted_on_demand(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

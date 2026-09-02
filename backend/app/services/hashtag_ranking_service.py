@@ -13,7 +13,14 @@ from app.repositories.hashtag_video_daily_stat_repository import (
     RankingMetric,
 )
 from app.repositories.project_repository import ProjectRepository
-from app.schemas.youtube import HashtagRankingRead, YoutubeRankingMetric, YoutubeVideoDetails
+from app.schemas.youtube import (
+    HashtagRankingRead,
+    HashtagVideoDailyStatRead,
+    HashtagWeeklyRankingRead,
+    HashtagWeeklyRankingVideoRead,
+    YoutubeRankingMetric,
+    YoutubeVideoDetails,
+)
 from app.services.project_service import ProjectService
 from app.services.youtube_download_service import YoutubeDownloadService
 from app.services.youtube_service import (
@@ -25,6 +32,10 @@ from app.services.youtube_service import (
 
 class HashtagRankingNotFoundError(Exception):
     """Raised when a ranking item does not belong to the requested project."""
+
+
+class ProjectHashtagRequiredError(Exception):
+    """Raised when a project has no hashtag configured."""
 
 
 @dataclass(frozen=True)
@@ -135,6 +146,58 @@ class HashtagRankingService:
             errors=errors,
         )
 
+    async def sync_project(
+        self,
+        database: Session,
+        *,
+        project_id: uuid.UUID,
+        snapshot_date: date | None = None,
+    ) -> HashtagRankingRead:
+        project = self.project_service.get_by_id(database, project_id)
+        hashtag = self.normalize_hashtag(project.hashtag)
+        if hashtag is None:
+            raise ProjectHashtagRequiredError("Cadastre uma hashtag antes de atualizar o ranking.")
+
+        target_date = snapshot_date or date.today()
+        previous_date, previous_stats = self.repository.list_latest_before(
+            database,
+            project_id,
+            target_date,
+            limit=settings.youtube_ranking_candidate_limit,
+        )
+        videos = await self.youtube.search_hashtag_statistics(
+            hashtag,
+            limit=settings.youtube_ranking_candidate_limit,
+            carryover_video_ids=[stat.video_id for stat in previous_stats],
+        )
+        has_24_hour_baseline = previous_date == target_date - timedelta(days=1)
+        previous_views = (
+            {stat.video_id: stat.views for stat in previous_stats}
+            if has_24_hour_baseline
+            else {}
+        )
+        self.repository.replace_snapshot(
+            database,
+            project_id=project_id,
+            snapshot_date=target_date,
+            stats=[
+                self._build_stat(
+                    project_id=project_id,
+                    hashtag=hashtag,
+                    snapshot_date=target_date,
+                    video=video,
+                    previous_views=previous_views,
+                )
+                for video in videos
+            ],
+        )
+        return self.list_for_project(
+            database,
+            project_id=project_id,
+            metric=YoutubeRankingMetric.view_delta,
+            limit=settings.youtube_ranking_top_limit,
+        )
+
     def list_for_project(
         self,
         database: Session,
@@ -175,6 +238,64 @@ class HashtagRankingService:
         if stat is None:
             raise HashtagRankingNotFoundError
         return self.downloader.get_temporary_download_url(stat.video_id)
+
+    def list_weekly_for_project(
+        self,
+        database: Session,
+        *,
+        project_id: uuid.UUID,
+        limit: int = 3,
+    ) -> HashtagWeeklyRankingRead:
+        project = self.project_service.get_by_id(database, project_id)
+        hashtag = self.normalize_hashtag(project.hashtag)
+        period_end = self.repository.latest_date(database, project_id)
+        if period_end is None:
+            return HashtagWeeklyRankingRead(
+                hashtag=hashtag,
+                period_start=None,
+                period_end=None,
+                videos=[],
+            )
+
+        period_start = period_end - timedelta(days=6)
+        stats = self.repository.list_between(
+            database,
+            project_id,
+            start_date=period_start,
+            end_date=period_end,
+        )
+        grouped: dict[str, list[HashtagVideoDailyStat]] = defaultdict(list)
+        for stat in stats:
+            grouped[stat.video_id].append(stat)
+
+        ranked: list[tuple[int, int, HashtagVideoDailyStat, int | None]] = []
+        for video_stats in grouped.values():
+            first = video_stats[0]
+            latest = video_stats[-1]
+            weekly_delta = latest.views - first.views if len(video_stats) > 1 else None
+            ranked.append(
+                (
+                    weekly_delta if weekly_delta is not None else -1,
+                    latest.views,
+                    latest,
+                    weekly_delta,
+                )
+            )
+
+        ranked.sort(key=lambda item: (item[0], item[1]), reverse=True)
+        videos = [
+            HashtagWeeklyRankingVideoRead(
+                **HashtagVideoDailyStatRead.model_validate(stat).model_dump(),
+                weekly_view_delta=weekly_delta,
+            )
+            for _, _, stat, weekly_delta in ranked[:limit]
+        ]
+        return HashtagWeeklyRankingRead(
+            hashtag=hashtag,
+            period_start=period_start,
+            period_end=period_end,
+            videos=videos,
+        )
 
     @staticmethod
     def normalize_hashtag(value: str | None) -> str | None:

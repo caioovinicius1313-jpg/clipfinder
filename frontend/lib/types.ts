@@ -81,6 +81,17 @@ export type HashtagRanking = {
   videos: HashtagRankingVideo[];
 };
 
+export type HashtagWeeklyRankingVideo = HashtagRankingVideo & {
+  weekly_view_delta: number | null;
+};
+
+export type HashtagWeeklyRanking = {
+  hashtag: string | null;
+  period_start: string | null;
+  period_end: string | null;
+  videos: HashtagWeeklyRankingVideo[];
+};
+
 export type ProjectDetail = Project & {
   source_videos: SourceVideo[];
   reference_videos: ReferenceVideo[];

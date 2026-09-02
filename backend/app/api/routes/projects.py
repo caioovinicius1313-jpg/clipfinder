@@ -31,6 +31,7 @@ from app.schemas.storage import (
 )
 from app.schemas.youtube import (
     HashtagRankingRead,
+    HashtagWeeklyRankingRead,
     YoutubeRankingMetric,
     YoutubeSearchResult,
 )
@@ -41,6 +42,7 @@ from app.services.generated_clip_service import (
 from app.services.hashtag_ranking_service import (
     HashtagRankingNotFoundError,
     HashtagRankingService,
+    ProjectHashtagRequiredError,
 )
 from app.services.matching_service import MatchingPrerequisiteError, MatchingService
 from app.services.multipart_upload_service import InvalidUploadError, MultipartUploadService
@@ -83,7 +85,10 @@ def get_project(project_id: uuid.UUID, database: DatabaseSession) -> ProjectDeta
     try:
         return ProjectService().get_by_id(database, project_id)
     except ProjectNotFoundError as error:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Project not found") from error
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Project not found",
+        ) from error
 
 
 @router.delete("/{project_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -229,7 +234,10 @@ async def search_youtube_videos(
     except ProjectNotFoundError as error:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Project not found") from error
     except YoutubeConfigurationError as error:
-        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(error)) from error
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=str(error),
+        ) from error
     except YoutubeRequestError as error:
         raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(error)) from error
 
@@ -249,7 +257,57 @@ def get_hashtag_ranking(
             limit=limit,
         )
     except ProjectNotFoundError as error:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Project not found") from error
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Project not found",
+        ) from error
+
+
+@router.post("/{project_id}/youtube/ranking/refresh", response_model=HashtagRankingRead)
+async def refresh_hashtag_ranking(
+    project_id: uuid.UUID,
+    database: DatabaseSession,
+) -> HashtagRankingRead:
+    try:
+        return await HashtagRankingService().sync_project(
+            database,
+            project_id=project_id,
+        )
+    except ProjectNotFoundError as error:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Project not found",
+        ) from error
+    except ProjectHashtagRequiredError as error:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(error)) from error
+    except YoutubeConfigurationError as error:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=str(error),
+        ) from error
+    except YoutubeRequestError as error:
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(error)) from error
+
+
+@router.get(
+    "/{project_id}/youtube/ranking/weekly",
+    response_model=HashtagWeeklyRankingRead,
+)
+def get_weekly_hashtag_ranking(
+    project_id: uuid.UUID,
+    database: DatabaseSession,
+) -> HashtagWeeklyRankingRead:
+    try:
+        return HashtagRankingService().list_weekly_for_project(
+            database,
+            project_id=project_id,
+            limit=3,
+        )
+    except ProjectNotFoundError as error:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Project not found",
+        ) from error
 
 
 @router.get("/{project_id}/youtube/ranking/{stat_id}/download")

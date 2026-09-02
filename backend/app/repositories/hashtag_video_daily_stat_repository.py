@@ -72,6 +72,28 @@ class HashtagVideoDailyStatRepository:
             limit=limit,
         )
 
+    def list_between(
+        self,
+        database: Session,
+        project_id: uuid.UUID,
+        *,
+        start_date: date,
+        end_date: date,
+    ) -> list[HashtagVideoDailyStat]:
+        statement = (
+            select(HashtagVideoDailyStat)
+            .where(
+                HashtagVideoDailyStat.project_id == project_id,
+                HashtagVideoDailyStat.snapshot_date >= start_date,
+                HashtagVideoDailyStat.snapshot_date <= end_date,
+            )
+            .order_by(
+                HashtagVideoDailyStat.video_id,
+                HashtagVideoDailyStat.snapshot_date,
+            )
+        )
+        return list(database.scalars(statement))
+
     def replace_snapshot(
         self,
         database: Session,

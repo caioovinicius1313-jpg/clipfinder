@@ -49,3 +49,14 @@ class HashtagRankingRead(BaseModel):
     snapshot_date: date | None
     metric: YoutubeRankingMetric
     videos: list[HashtagVideoDailyStatRead] = Field(default_factory=list)
+
+
+class HashtagWeeklyRankingVideoRead(HashtagVideoDailyStatRead):
+    weekly_view_delta: int | None
+
+
+class HashtagWeeklyRankingRead(BaseModel):
+    hashtag: str | None
+    period_start: date | None
+    period_end: date | None
+    videos: list[HashtagWeeklyRankingVideoRead] = Field(default_factory=list)
