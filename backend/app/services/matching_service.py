@@ -37,14 +37,26 @@ class MatchingService:
         self.audio_matching_service = audio_matching_service or AudioMatchingService()
         self.storage = storage or StorageService()
 
-    def create_jobs(self, database: Session, project_id: uuid.UUID) -> list[uuid.UUID]:
+    def create_jobs(
+        self,
+        database: Session,
+        project_id: uuid.UUID,
+        reference_video_ids: list[uuid.UUID] | None = None,
+    ) -> list[uuid.UUID]:
         source_video = self.source_repository.get_latest_for_project(database, project_id)
         if source_video is None:
             raise MatchingPrerequisiteError("Envie o vídeo original antes de gerar cortes.")
 
         reference_videos = self.reference_repository.list_uploaded(database, project_id)
+        if reference_video_ids is not None:
+            selected_ids = set(reference_video_ids)
+            reference_videos = [
+                reference for reference in reference_videos if reference.id in selected_ids
+            ]
         if not reference_videos:
-            raise MatchingPrerequisiteError("Envie pelo menos um vídeo de referência antes de gerar cortes.")
+            raise MatchingPrerequisiteError(
+                "Envie pelo menos um vídeo de referência antes de gerar cortes."
+            )
 
         try:
             self._ensure_stored_file_exists(source_video.path)

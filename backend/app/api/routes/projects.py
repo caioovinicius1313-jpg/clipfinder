@@ -17,6 +17,12 @@ from fastapi.responses import FileResponse, RedirectResponse
 from sqlalchemy.orm import Session
 
 from app.api.dependencies import get_db
+from app.schemas.automation import (
+    AutomationRunRead,
+    AutomationSearchRequest,
+    AutomationSearchResponse,
+    AutomationStartRequest,
+)
 from app.schemas.generated_clip import MatchGenerationResponse
 from app.schemas.project import ProjectCreate, ProjectDetail, ProjectRead
 from app.schemas.reference_video import ReferenceVideoRead, YoutubeReferenceCreate
@@ -34,6 +40,11 @@ from app.schemas.youtube import (
     HashtagWeeklyRankingRead,
     YoutubeRankingMetric,
     YoutubeSearchResult,
+)
+from app.services.automation_service import (
+    AutomationRunNotFoundError,
+    AutomationSelectionError,
+    AutomationService,
 )
 from app.services.generated_clip_service import (
     GeneratedClipNotAvailableError,
@@ -68,6 +79,91 @@ from app.services.youtube_service import (
 router = APIRouter(prefix="/projects", tags=["projects"])
 
 DatabaseSession = Annotated[Session, Depends(get_db)]
+
+
+@router.post(
+    "/{project_id}/automation/search",
+    response_model=AutomationSearchResponse,
+)
+async def search_automation_candidates(
+    project_id: uuid.UUID,
+    payload: AutomationSearchRequest,
+    database: DatabaseSession,
+) -> AutomationSearchResponse:
+    try:
+        return await AutomationService().search(
+            database, project_id=project_id, payload=payload
+        )
+    except ProjectNotFoundError as error:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Project not found"
+        ) from error
+    except YoutubeDownloadError as error:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(error)) from error
+    except YoutubeConfigurationError as error:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(error)
+        ) from error
+    except YoutubeRequestError as error:
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(error)) from error
+
+
+@router.post(
+    "/{project_id}/automation/runs",
+    response_model=AutomationRunRead,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+async def start_automation_run(
+    project_id: uuid.UUID,
+    payload: AutomationStartRequest,
+    background_tasks: BackgroundTasks,
+    database: DatabaseSession,
+) -> AutomationRunRead:
+    try:
+        automation_service = AutomationService()
+        result = await automation_service.start(
+            database, project_id=project_id, payload=payload
+        )
+        background_tasks.add_task(
+            automation_service.process_run,
+            result.run.id,
+            project_id,
+            result.source_video_id,
+            result.reference_video_ids,
+        )
+        return result.run
+    except ProjectNotFoundError as error:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Project not found"
+        ) from error
+    except (AutomationSelectionError, YoutubeDownloadError) as error:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(error)) from error
+    except YoutubeConfigurationError as error:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(error)
+        ) from error
+    except YoutubeRequestError as error:
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(error)) from error
+
+
+@router.get(
+    "/{project_id}/automation/runs/{run_id}",
+    response_model=AutomationRunRead,
+)
+def get_automation_run(
+    project_id: uuid.UUID,
+    run_id: uuid.UUID,
+    database: DatabaseSession,
+) -> AutomationRunRead:
+    try:
+        return AutomationService().get_run(
+            database, project_id=project_id, run_id=run_id
+        )
+    except (ProjectNotFoundError, AutomationRunNotFoundError) as error:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Automação não encontrada.",
+        ) from error
 
 
 @router.post("", response_model=ProjectRead, status_code=status.HTTP_201_CREATED)

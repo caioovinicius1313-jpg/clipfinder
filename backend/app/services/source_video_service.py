@@ -79,3 +79,37 @@ class SourceVideoService:
             raise
         finally:
             file.file.close()
+
+    def import_downloaded(
+        self,
+        database: Session,
+        *,
+        project_id: uuid.UUID,
+        downloaded_path: Path,
+        filename: str,
+    ) -> SourceVideo:
+        self.project_service.get_by_id(database, project_id)
+        extension = downloaded_path.suffix.lower() or ".mp4"
+        relative_path = Path("projects") / str(project_id) / "source" / f"{uuid.uuid4()}{extension}"
+        object_key = relative_path.as_posix()
+        duration = MediaProcessingService().probe_duration(downloaded_path)
+        size = downloaded_path.stat().st_size
+        if self.storage.bucket_enabled:
+            stored_path = self.storage.upload_file(
+                downloaded_path,
+                object_key=object_key,
+                content_type="video/mp4",
+            )
+        else:
+            absolute_path = Path(settings.storage_path) / relative_path
+            absolute_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(downloaded_path, absolute_path)
+            stored_path = str(relative_path)
+        return self.repository.create(
+            database,
+            project_id=project_id,
+            filename=filename,
+            path=stored_path,
+            size=size,
+            duration=duration,
+        )

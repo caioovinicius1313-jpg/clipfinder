@@ -101,3 +101,32 @@ class ReferenceVideoRepository:
             database.delete(generated_clip)
         database.delete(reference_video)
         database.commit()
+
+    def set_status(
+        self, database: Session, reference_video: ReferenceVideo, status: str
+    ) -> ReferenceVideo:
+        reference_video.status = status
+        database.add(reference_video)
+        database.commit()
+        database.refresh(reference_video)
+        return reference_video
+
+    def attach_downloaded_file(
+        self,
+        database: Session,
+        reference_video: ReferenceVideo,
+        *,
+        filename: str,
+        path: str,
+        size: int,
+        duration: float | None,
+    ) -> ReferenceVideo:
+        reference_video.filename = filename
+        reference_video.path = path
+        reference_video.size = size
+        reference_video.duration = duration
+        reference_video.status = "uploaded"
+        database.add(reference_video)
+        database.commit()
+        database.refresh(reference_video)
+        return reference_video

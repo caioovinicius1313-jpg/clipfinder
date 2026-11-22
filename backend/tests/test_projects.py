@@ -26,6 +26,8 @@ from app.repositories.hashtag_video_daily_stat_repository import HashtagVideoDai
 from app.repositories.reference_video_repository import ReferenceVideoRepository
 from app.schemas.storage import MultipartUploadStart
 from app.schemas.youtube import YoutubeRankingMetric, YoutubeVideoDetails
+from app.schemas.automation import AutomationCandidateRead
+from app.services.automation_service import AutomationService
 from app.services.hashtag_ranking_service import HashtagRankingService
 from app.services.media_processing_service import (
     AudioAnalysis,
@@ -39,6 +41,158 @@ from app.services.media_processing_service import (
 from app.services.multipart_upload_service import MultipartUploadService
 from app.services.storage_service import StorageService
 from app.services.youtube_download_service import YoutubeDownloadService
+from app.services.youtube_service import YoutubeService
+
+
+def test_extracts_supported_youtube_video_urls() -> None:
+    service = YoutubeDownloadService()
+
+    assert service.extract_video_id("https://www.youtube.com/watch?v=abc123_DEF") == "abc123_DEF"
+    assert service.extract_video_id("https://youtu.be/abc123_DEF?t=10") == "abc123_DEF"
+    assert service.extract_video_id("https://www.youtube.com/shorts/abc123_DEF") == "abc123_DEF"
+
+
+def test_youtube_download_can_use_browser_cookies_and_node_runtime(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(settings, "youtube_cookies_base64", None)
+    monkeypatch.setattr(settings, "youtube_cookies_file", None)
+    monkeypatch.setattr(settings, "youtube_cookies_from_browser", "edge")
+    monkeypatch.setattr(
+        "app.services.youtube_download_service.shutil.which",
+        lambda executable: "C:/Program Files/nodejs/node.exe" if executable == "node" else None,
+    )
+
+    command = YoutubeDownloadService()._build_command("abc123_DEF", tmp_path)
+
+    assert "--cookies-from-browser" in command
+    assert command[command.index("--cookies-from-browser") + 1] == "edge"
+    assert "--js-runtimes" in command
+    assert "--remote-components" in command
+
+
+def test_automation_search_and_selection_routes(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project = client.post(
+        "/projects",
+        json={"name": "Automático", "description": "", "hashtag": "#podcast"},
+    ).json()
+    candidates = [
+        AutomationCandidateRead(
+            video_id="clip123_XYZ",
+            title="Melhor momento",
+            description="#podcast",
+            channel_title="Canal",
+            url="https://www.youtube.com/watch?v=clip123_XYZ",
+            thumbnail_url="https://i.ytimg.com/vi/clip123_XYZ/hqdefault.jpg",
+            published_at=None,
+            views=25_000,
+            duration_seconds=42,
+            relevance_score=0.91,
+        )
+    ]
+
+    async def fake_search(*args, **kwargs):
+        return candidates
+
+    async def fake_details(*args, **kwargs):
+        return candidates
+
+    monkeypatch.setattr(YoutubeService, "search_automation_candidates", fake_search)
+    monkeypatch.setattr(YoutubeService, "get_automation_video_details", fake_details)
+    monkeypatch.setattr(AutomationService, "process_run", lambda *args, **kwargs: None)
+
+    search_response = client.post(
+        f"/projects/{project['id']}/automation/search",
+        json={
+            "source_url": "https://www.youtube.com/watch?v=source123_X",
+            "hashtag": "#podcast",
+        },
+    )
+    assert search_response.status_code == 200
+    assert search_response.json()["source_video_id"] == "source123_X"
+    assert search_response.json()["candidates"][0]["video_id"] == "clip123_XYZ"
+
+    start_response = client.post(
+        f"/projects/{project['id']}/automation/runs",
+        json={
+            "source_url": "https://www.youtube.com/watch?v=source123_X",
+            "hashtag": "podcast",
+            "selected_video_ids": ["clip123_XYZ"],
+        },
+    )
+    assert start_response.status_code == 202
+    run = start_response.json()
+    assert run["status"] == "queued"
+    assert run["total_references"] == 1
+
+    poll_response = client.get(
+        f"/projects/{project['id']}/automation/runs/{run['id']}"
+    )
+    assert poll_response.status_code == 200
+    assert poll_response.json()["id"] == run["id"]
+
+    detail = client.get(f"/projects/{project['id']}").json()
+    assert detail["reference_videos"][0]["external_id"] == "clip123_XYZ"
+    assert detail["reference_videos"][0]["status"] == "queued"
+
+
+def test_youtube_search_scores_and_excludes_original() -> None:
+    service = YoutubeService()
+    calls: list[tuple[str, dict[str, object]]] = []
+
+    async def fake_request(endpoint: str, parameters: dict[str, object]):
+        calls.append((endpoint, parameters))
+        if endpoint == service.search_endpoint:
+            return {
+                "items": [
+                    {"id": {"videoId": "source123_X"}},
+                    {"id": {"videoId": "clipAAA_123"}},
+                    {"id": {"videoId": "clipBBB_456"}},
+                ]
+            }
+        return {
+            "items": [
+                {
+                    "id": "clipAAA_123",
+                    "snippet": {
+                        "title": "Corte A",
+                        "description": "#podcast",
+                        "channelTitle": "Canal A",
+                        "publishedAt": "2026-11-20T12:00:00Z",
+                        "thumbnails": {},
+                    },
+                    "statistics": {"viewCount": "50000"},
+                    "contentDetails": {"duration": "PT45S"},
+                },
+                {
+                    "id": "clipBBB_456",
+                    "snippet": {
+                        "title": "Corte B",
+                        "description": "#podcast",
+                        "channelTitle": "Canal B",
+                        "publishedAt": "2026-11-19T12:00:00Z",
+                        "thumbnails": {},
+                    },
+                    "statistics": {"viewCount": "1000"},
+                    "contentDetails": {"duration": "PT1M10S"},
+                },
+            ]
+        }
+
+    service._request = fake_request  # type: ignore[method-assign]
+    results = asyncio.run(
+        service.search_automation_candidates(
+            "podcast", source_video_id="source123_X", limit=10
+        )
+    )
+
+    assert [result.video_id for result in results] == ["clipAAA_123", "clipBBB_456"]
+    assert results[0].relevance_score > results[1].relevance_score
+    assert all(result.video_id != "source123_X" for result in results)
+    assert calls[0][1]["q"] == "#podcast"
+    assert calls[0][1]["videoDuration"] == "short"
 
 
 @pytest.fixture()

@@ -8,6 +8,7 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 from app.core.database import Base
 
 if TYPE_CHECKING:
+    from app.models.automation_run import AutomationRun
     from app.models.generated_clip import GeneratedClip
     from app.models.hashtag_video_daily_stat import HashtagVideoDailyStat
     from app.models.reference_video import ReferenceVideo
@@ -35,5 +36,8 @@ class Project(Base):
         back_populates="project", cascade="all, delete-orphan"
     )
     hashtag_video_daily_stats: Mapped[list["HashtagVideoDailyStat"]] = relationship(
+        back_populates="project", cascade="all, delete-orphan"
+    )
+    automation_runs: Mapped[list["AutomationRun"]] = relationship(
         back_populates="project", cascade="all, delete-orphan"
     )
