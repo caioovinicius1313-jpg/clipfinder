@@ -71,6 +71,46 @@ def test_youtube_download_can_use_browser_cookies_and_node_runtime(
     assert "--remote-components" in command
 
 
+def test_youtube_download_retries_with_default_clients_when_formats_are_unavailable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[list[str]] = []
+    monkeypatch.setattr(settings, "youtube_cookies_base64", None)
+    monkeypatch.setattr(settings, "youtube_cookies_file", None)
+    monkeypatch.setattr(settings, "youtube_cookies_from_browser", None)
+    monkeypatch.setattr(settings, "ffmpeg_path", None)
+    monkeypatch.setattr("app.services.youtube_download_service.shutil.which", lambda _: None)
+
+    def fake_run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        calls.append(command)
+        if len(calls) == 1:
+            return subprocess.CompletedProcess(
+                args=command,
+                returncode=1,
+                stdout="",
+                stderr="ERROR: Requested format is not available",
+            )
+        downloaded_file = tmp_path / "source.mp4"
+        downloaded_file.write_bytes(b"video")
+        return subprocess.CompletedProcess(
+            args=command,
+            returncode=0,
+            stdout=f"{downloaded_file}\n",
+            stderr="",
+        )
+
+    monkeypatch.setattr("app.services.youtube_download_service.subprocess.run", fake_run)
+
+    result = YoutubeDownloadService().download_video(
+        "abc123_DEF", tmp_path, filename_stem="source"
+    )
+
+    assert result == tmp_path / "source.mp4"
+    assert len(calls) == 2
+    assert "--extractor-args" in calls[0]
+    assert "--extractor-args" not in calls[1]
+
+
 def test_automation_search_and_selection_routes(
     client: TestClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1153,6 +1193,9 @@ def test_youtube_download_link_is_extracted_on_demand(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     captured_command: list[str] = []
+    monkeypatch.setattr(settings, "youtube_cookies_base64", None)
+    monkeypatch.setattr(settings, "youtube_cookies_file", None)
+    monkeypatch.setattr(settings, "youtube_cookies_from_browser", None)
 
     def fake_run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
         captured_command.extend(command)

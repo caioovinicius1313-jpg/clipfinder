@@ -101,6 +101,42 @@ class YoutubeDownloadService:
             raise YoutubeDownloadError("Identificador de vídeo inválido.")
         destination_directory.mkdir(parents=True, exist_ok=True)
         output_template = destination_directory / f"{filename_stem}.%(ext)s"
+        command = self._build_download_command(
+            video_id,
+            destination_directory,
+            output_template=output_template,
+            reference_quality=reference_quality,
+            use_configured_clients=True,
+        )
+        result = self._run_download_command(command)
+        downloaded_path = self._downloaded_path(result.stdout)
+
+        if result.returncode != 0 and self._is_unavailable_format_error(result.stderr):
+            # YouTube does not expose the same formats to every player client.
+            # Let yt-dlp select its current defaults once before failing the run.
+            fallback_command = self._build_download_command(
+                video_id,
+                destination_directory,
+                output_template=output_template,
+                reference_quality=reference_quality,
+                use_configured_clients=False,
+            )
+            result = self._run_download_command(fallback_command)
+            downloaded_path = self._downloaded_path(result.stdout)
+
+        if result.returncode != 0 or downloaded_path is None:
+            self._raise_download_error(result.stderr)
+        return downloaded_path
+
+    def _build_download_command(
+        self,
+        video_id: str,
+        destination_directory: Path,
+        *,
+        output_template: Path,
+        reference_quality: bool,
+        use_configured_clients: bool,
+    ) -> list[str]:
         command = [
             sys.executable,
             "-m",
@@ -116,26 +152,34 @@ class YoutubeDownloadService:
             ),
             "--merge-output-format",
             "mp4",
-            "--extractor-args",
-            self.extractor_args,
-            "--retries",
-            "3",
-            "--extractor-retries",
-            "3",
-            "--sleep-requests",
-            "0.75",
-            "--output",
-            str(output_template),
-            "--print",
-            "after_move:filepath",
         ]
+        if use_configured_clients:
+            command.extend(["--extractor-args", self.extractor_args])
+        command.extend(
+            [
+                "--retries",
+                "3",
+                "--extractor-retries",
+                "3",
+                "--sleep-requests",
+                "0.75",
+                "--output",
+                str(output_template),
+                "--print",
+                "after_move:filepath",
+            ]
+        )
         if settings.ffmpeg_path:
             command.extend(["--ffmpeg-location", settings.ffmpeg_path])
         self._add_authentication(command, destination_directory)
         self._add_javascript_runtime(command)
         command.append(f"https://www.youtube.com/watch?v={video_id}")
+        return command
+
+    @staticmethod
+    def _run_download_command(command: list[str]) -> subprocess.CompletedProcess[str]:
         try:
-            result = subprocess.run(
+            return subprocess.run(
                 command,
                 check=False,
                 capture_output=True,
@@ -151,11 +195,14 @@ class YoutubeDownloadService:
         except OSError as error:
             raise YoutubeDownloadError("O yt-dlp não está disponível no servidor.") from error
 
-        printed_paths = [Path(line.strip()) for line in result.stdout.splitlines() if line.strip()]
-        downloaded_path = next((path for path in reversed(printed_paths) if path.is_file()), None)
-        if result.returncode != 0 or downloaded_path is None:
-            self._raise_download_error(result.stderr)
-        return downloaded_path
+    @staticmethod
+    def _downloaded_path(stdout: str) -> Path | None:
+        printed_paths = [Path(line.strip()) for line in stdout.splitlines() if line.strip()]
+        return next((path for path in reversed(printed_paths) if path.is_file()), None)
+
+    @staticmethod
+    def _is_unavailable_format_error(stderr: str) -> bool:
+        return "Requested format is not available" in stderr
 
     def _build_command(self, video_id: str, temporary_directory: Path) -> list[str]:
         command = [
