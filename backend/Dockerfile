@@ -1,9 +1,16 @@
+FROM node:22-bookworm-slim AS node_runtime
+
 FROM python:3.12-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
 
 WORKDIR /app
+
+# yt-dlp needs a supported JavaScript runtime to solve YouTube's current
+# player challenges. Copy the matching Node 22 runtime into the Python image.
+COPY --from=node_runtime /usr/local/bin/node /usr/local/bin/node
+COPY --from=node_runtime /usr/local/lib/node_modules /usr/local/lib/node_modules
 
 RUN apt-get update \
     && apt-get install --no-install-recommends -y ffmpeg \
