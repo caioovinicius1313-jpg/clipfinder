@@ -59,6 +59,43 @@ export type YoutubeSearchResult = {
   published_at: string | null;
 };
 
+export type AutomationCandidate = YoutubeSearchResult & {
+  views: number;
+  duration_seconds: number;
+  relevance_score: number;
+};
+
+export type AutomationSearchResponse = {
+  source_video_id: string;
+  hashtag: string;
+  candidates: AutomationCandidate[];
+  next_page_token: string | null;
+  search_window_start: string;
+};
+
+export type AutomationSearchSort = "relevance" | "recent" | "views";
+
+export type AutomationRun = {
+  id: string;
+  project_id: string;
+  source_video_id: string | null;
+  source_url: string;
+  hashtag: string;
+  status:
+    | "queued"
+    | "downloading_source"
+    | "downloading_references"
+    | "matching"
+    | "completed"
+    | "failed";
+  total_references: number;
+  ready_references: number;
+  jobs_started: number;
+  error_message: string | null;
+  created_at: string;
+  updated_at: string;
+};
+
 export type YoutubeRankingMetric = "views" | "view_delta";
 
 export type HashtagRankingVideo = {

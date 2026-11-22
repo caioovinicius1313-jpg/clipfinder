@@ -81,15 +81,20 @@ class AutomationService:
     ) -> AutomationSearchResponse:
         self.project_service.get_by_id(database, project_id)
         source_video_id = self.downloader.extract_video_id(str(payload.source_url))
-        candidates = await self.youtube.search_automation_candidates(
+        candidates, next_page_token, search_window_start = await self.youtube.search_automation_candidates(
             payload.hashtag,
             source_video_id=source_video_id,
             limit=10,
+            sort_by=payload.sort_by,
+            page_token=payload.page_token,
+            published_after=payload.published_after,
         )
         return AutomationSearchResponse(
             source_video_id=source_video_id,
             hashtag=payload.hashtag,
             candidates=candidates,
+            next_page_token=next_page_token,
+            search_window_start=search_window_start,
         )
 
     async def start(

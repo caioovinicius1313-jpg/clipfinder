@@ -1,4 +1,7 @@
 import type {
+  AutomationRun,
+  AutomationSearchResponse,
+  AutomationSearchSort,
   GeneratedClip,
   HashtagRanking,
   HashtagWeeklyRanking,
@@ -282,4 +285,36 @@ export function generateClips(projectId: string): Promise<{ message: string; job
 
 export function generatedClipDownloadUrl(projectId: string, clipId: string): string {
   return `${API_URL}/projects/${projectId}/generated-clips/${clipId}/download`;
+}
+
+export function searchAutomationCandidates(
+  projectId: string,
+  payload: {
+    source_url: string;
+    hashtag: string;
+    sort_by: AutomationSearchSort;
+    page_token?: string | null;
+    published_after?: string | null;
+  },
+): Promise<AutomationSearchResponse> {
+  return request<AutomationSearchResponse>(`/projects/${projectId}/automation/search`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+}
+
+export function startAutomationRun(
+  projectId: string,
+  payload: { source_url: string; hashtag: string; selected_video_ids: string[] },
+): Promise<AutomationRun> {
+  return request<AutomationRun>(`/projects/${projectId}/automation/runs`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+}
+
+export function getAutomationRun(projectId: string, runId: string): Promise<AutomationRun> {
+  return request<AutomationRun>(`/projects/${projectId}/automation/runs/${runId}`);
 }

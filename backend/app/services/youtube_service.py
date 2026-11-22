@@ -129,25 +129,28 @@ class YoutubeService:
         *,
         source_video_id: str,
         limit: int = 10,
-    ) -> list[AutomationCandidateRead]:
+        sort_by: str = "relevance",
+        page_token: str | None = None,
+        published_after: datetime | None = None,
+    ) -> tuple[list[AutomationCandidateRead], str | None, datetime]:
         clean_hashtag = hashtag.strip().lstrip("#")
         search_limit = min(max(limit * 3, 10), 50)
-        published_after = (datetime.now(timezone.utc) - timedelta(days=7)).isoformat().replace(
-            "+00:00", "Z"
+        search_window_start = published_after or (
+            datetime.now(timezone.utc) - timedelta(hours=24 if sort_by == "recent" else 168)
         )
-        search_payload = await self._request(
-            self.search_endpoint,
-            {
-                "part": "snippet",
-                "type": "video",
-                "q": f"#{clean_hashtag}",
-                "order": "relevance",
-                "publishedAfter": published_after,
-                "videoDuration": "short",
-                "maxResults": search_limit,
-                "fields": "items(id/videoId)",
-            },
-        )
+        search_params: dict[str, str | int] = {
+            "part": "snippet",
+            "type": "video",
+            "q": f"#{clean_hashtag}",
+            "order": {"relevance": "relevance", "recent": "date", "views": "viewCount"}[sort_by],
+            "publishedAfter": search_window_start.isoformat().replace("+00:00", "Z"),
+            "videoDuration": "short",
+            "maxResults": search_limit,
+            "fields": "items(id/videoId),nextPageToken",
+        }
+        if page_token:
+            search_params["pageToken"] = page_token
+        search_payload = await self._request(self.search_endpoint, search_params)
         ranked_ids = [
             item.get("id", {}).get("videoId") for item in search_payload.get("items", [])
         ]
@@ -157,7 +160,7 @@ class YoutubeService:
             if video_id and video_id != source_video_id
         ]
         if not ranked_ids:
-            return []
+            return [], search_payload.get("nextPageToken"), search_window_start
 
         details = await self.get_automation_video_details(ranked_ids)
         details_by_id = {item.video_id: item for item in details}
@@ -174,7 +177,7 @@ class YoutubeService:
         if exact_hashtag_matches:
             eligible = exact_hashtag_matches
         if not eligible:
-            return []
+            return [], search_payload.get("nextPageToken"), search_window_start
 
         max_log_views = max(math.log1p(item.views) for item in eligible) or 1
         total_ranked = max(len(eligible), 1)
@@ -192,7 +195,16 @@ class YoutubeService:
             score = min(1.0, 0.55 * api_relevance + 0.35 * popularity + 0.10 * recency)
             scored.append(item.model_copy(update={"relevance_score": round(score, 4)}))
 
-        return sorted(scored, key=lambda item: item.relevance_score, reverse=True)[:limit]
+        if sort_by == "recent":
+            scored.sort(
+                key=lambda item: item.published_at or datetime.min.replace(tzinfo=timezone.utc),
+                reverse=True,
+            )
+        elif sort_by == "views":
+            scored.sort(key=lambda item: item.views, reverse=True)
+        else:
+            scored.sort(key=lambda item: item.relevance_score, reverse=True)
+        return scored[:limit], search_payload.get("nextPageToken"), search_window_start
 
     async def get_automation_video_details(
         self, video_ids: Iterable[str]

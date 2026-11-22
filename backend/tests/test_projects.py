@@ -3,7 +3,7 @@ import base64
 import subprocess
 import uuid
 from collections.abc import Generator
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -134,7 +134,7 @@ def test_automation_search_and_selection_routes(
     ]
 
     async def fake_search(*args, **kwargs):
-        return candidates
+        return candidates, "page-two", datetime(2026, 11, 15, tzinfo=timezone.utc)
 
     async def fake_details(*args, **kwargs):
         return candidates
@@ -153,6 +153,8 @@ def test_automation_search_and_selection_routes(
     assert search_response.status_code == 200
     assert search_response.json()["source_video_id"] == "source123_X"
     assert search_response.json()["candidates"][0]["video_id"] == "clip123_XYZ"
+    assert search_response.json()["next_page_token"] == "page-two"
+    assert search_response.json()["search_window_start"] == "2026-11-15T00:00:00Z"
 
     start_response = client.post(
         f"/projects/{project['id']}/automation/runs",
@@ -190,7 +192,8 @@ def test_youtube_search_scores_and_excludes_original() -> None:
                     {"id": {"videoId": "source123_X"}},
                     {"id": {"videoId": "clipAAA_123"}},
                     {"id": {"videoId": "clipBBB_456"}},
-                ]
+                ],
+                "nextPageToken": "next-page",
             }
         return {
             "items": [
@@ -222,17 +225,53 @@ def test_youtube_search_scores_and_excludes_original() -> None:
         }
 
     service._request = fake_request  # type: ignore[method-assign]
-    results = asyncio.run(
+    results, next_page_token, search_window_start = asyncio.run(
         service.search_automation_candidates(
             "podcast", source_video_id="source123_X", limit=10
         )
     )
 
     assert [result.video_id for result in results] == ["clipAAA_123", "clipBBB_456"]
+    assert next_page_token == "next-page"
+    assert search_window_start.tzinfo is not None
     assert results[0].relevance_score > results[1].relevance_score
     assert all(result.video_id != "source123_X" for result in results)
     assert calls[0][1]["q"] == "#podcast"
     assert calls[0][1]["videoDuration"] == "short"
+
+    recent_results, _, recent_window_start = asyncio.run(
+        service.search_automation_candidates(
+            "podcast",
+            source_video_id="source123_X",
+            limit=10,
+            sort_by="recent",
+            page_token="next-page",
+        )
+    )
+    assert [result.video_id for result in recent_results] == ["clipAAA_123", "clipBBB_456"]
+    assert calls[2][1]["order"] == "date"
+    assert calls[2][1]["pageToken"] == "next-page"
+
+    _, _, continued_window_start = asyncio.run(
+        service.search_automation_candidates(
+            "podcast",
+            source_video_id="source123_X",
+            limit=10,
+            sort_by="recent",
+            page_token="next-page",
+            published_after=recent_window_start,
+        )
+    )
+    assert calls[4][1]["publishedAfter"] == recent_window_start.isoformat().replace("+00:00", "Z")
+    assert continued_window_start == recent_window_start
+
+    most_viewed_results, _, _ = asyncio.run(
+        service.search_automation_candidates(
+            "podcast", source_video_id="source123_X", limit=10, sort_by="views"
+        )
+    )
+    assert [result.video_id for result in most_viewed_results] == ["clipAAA_123", "clipBBB_456"]
+    assert calls[6][1]["order"] == "viewCount"
 
 
 @pytest.fixture()

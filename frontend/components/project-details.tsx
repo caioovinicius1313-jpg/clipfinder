@@ -4,6 +4,7 @@ import Link from "next/link";
 import { ChangeEvent, useEffect, useState } from "react";
 
 import { AppShell } from "@/components/app-shell";
+import { ClipAutomation } from "@/components/clip-automation";
 import { HashtagRankingSection } from "@/components/hashtag-ranking";
 import {
   addYoutubeReference,
@@ -58,6 +59,8 @@ function formatStatus(status: string): string {
   const labels: Record<string, string> = {
     uploaded: "Enviado",
     reference_only: "Apenas referência",
+    queued: "Na fila",
+    downloading: "Baixando",
     processing: "Processando",
     completed: "Concluído",
     failed: "Não encontrado",
@@ -105,7 +108,7 @@ function ReferenceCard({ reference, isDeleting, onDelete }: ReferenceCardProps) 
         <span className="font-medium text-indigo-700">{formatStatus(reference.status)}</span>
       </div>
       <p className="mt-3 text-slate-600">
-        {reference.source === "upload"
+        {reference.path
           ? `${formatFileSize(reference.size ?? 0)} · ${formatDuration(reference.duration)}`
           : "Link salvo como referência. Envie o arquivo do corte para usá-lo no matching."}
       </p>
@@ -306,6 +309,7 @@ export function ProjectDetails({ projectId }: ProjectDetailsProps) {
 
   const latestSourceVideo = project.source_videos.at(-1);
   const uploadedReferences = project.reference_videos.filter((reference) => reference.source === "upload");
+  const matchingReadyReferences = project.reference_videos.filter((reference) => Boolean(reference.path));
   const youtubeReferences = project.reference_videos.filter(
     (reference) => reference.source === "youtube",
   );
@@ -332,6 +336,12 @@ export function ProjectDetails({ projectId }: ProjectDetailsProps) {
       )}
 
       <HashtagRankingSection projectId={projectId} hashtag={project.hashtag} />
+
+      <ClipAutomation
+        projectId={projectId}
+        defaultHashtag={project.hashtag}
+        onProjectChanged={loadProject}
+      />
 
       <section className="mt-6 max-w-3xl rounded-xl border border-slate-200 bg-white p-6 sm:p-8">
         <h2 className="text-xl font-bold text-slate-900">Vídeo original</h2>
@@ -447,7 +457,7 @@ export function ProjectDetails({ projectId }: ProjectDetailsProps) {
       <section className="mt-6 max-w-3xl rounded-xl border border-slate-200 bg-white p-6 sm:p-8">
         <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
           <div><h2 className="text-xl font-bold text-slate-900">Matching e cortes</h2><p className="mt-2 text-slate-600">Compare os áudios enviados e gere cortes novos a partir do vídeo original.</p></div>
-          <div className="flex gap-3"><button type="button" onClick={() => { clearMessages(); loadProject().catch(() => setError("Não foi possível atualizar o status.")); }} className="rounded-lg border border-slate-300 px-4 py-2 font-semibold text-slate-700 hover:bg-slate-50">Atualizar status</button><button type="button" onClick={handleGenerateClips} disabled={isGenerating || !latestSourceVideo || uploadedReferences.length === 0} className="rounded-lg bg-indigo-600 px-4 py-2 font-semibold text-white hover:bg-indigo-700 disabled:cursor-not-allowed disabled:bg-indigo-300">{isGenerating ? "Iniciando..." : "Encontrar e gerar cortes"}</button></div>
+          <div className="flex gap-3"><button type="button" onClick={() => { clearMessages(); loadProject().catch(() => setError("Não foi possível atualizar o status.")); }} className="rounded-lg border border-slate-300 px-4 py-2 font-semibold text-slate-700 hover:bg-slate-50">Atualizar status</button><button type="button" onClick={handleGenerateClips} disabled={isGenerating || !latestSourceVideo || matchingReadyReferences.length === 0} className="rounded-lg bg-indigo-600 px-4 py-2 font-semibold text-white hover:bg-indigo-700 disabled:cursor-not-allowed disabled:bg-indigo-300">{isGenerating ? "Iniciando..." : "Encontrar e gerar cortes"}</button></div>
         </div>
         {project.generated_clips.length === 0 && <p className="mt-6 rounded-lg bg-slate-50 p-4 text-sm text-slate-600">Nenhum corte gerado ainda.</p>}
         {project.generated_clips.length > 0 && <div className="mt-6 space-y-3">{project.generated_clips.map((clip) => <GeneratedClipCard key={clip.id} clip={clip} projectId={projectId} />)}</div>}

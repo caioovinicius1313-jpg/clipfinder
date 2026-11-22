@@ -1,5 +1,6 @@
 import uuid
 from datetime import datetime
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, HttpUrl, field_validator
 
@@ -7,6 +8,9 @@ from pydantic import BaseModel, ConfigDict, Field, HttpUrl, field_validator
 class AutomationSearchRequest(BaseModel):
     source_url: HttpUrl
     hashtag: str = Field(min_length=1, max_length=100)
+    sort_by: Literal["relevance", "recent", "views"] = "relevance"
+    page_token: str | None = Field(default=None, max_length=512)
+    published_after: datetime | None = None
 
     @field_validator("hashtag")
     @classmethod
@@ -34,6 +38,8 @@ class AutomationSearchResponse(BaseModel):
     source_video_id: str
     hashtag: str
     candidates: list[AutomationCandidateRead]
+    next_page_token: str | None = None
+    search_window_start: datetime
 
 
 class AutomationStartRequest(AutomationSearchRequest):
