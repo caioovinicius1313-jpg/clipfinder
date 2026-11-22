@@ -16,7 +16,10 @@ class YoutubeDownloadError(Exception):
 
 
 class YoutubeDownloadService:
-    extractor_args = "youtube:player_client=default,web_embedded"
+    # `web_embedded` only exposes videos that allow embedding and can therefore
+    # return no formats for a perfectly public watch-page URL. Keep extraction
+    # on yt-dlp's default client set instead.
+    extractor_args = "youtube:player_client=default"
     video_id_pattern = re.compile(r"^[A-Za-z0-9_-]{6,100}$")
 
     def extract_video_id(self, value: str) -> str:

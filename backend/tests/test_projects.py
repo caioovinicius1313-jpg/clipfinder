@@ -1211,7 +1211,8 @@ def test_youtube_download_link_is_extracted_on_demand(
     url = YoutubeDownloadService().get_temporary_download_url("abc123_DEF")
 
     assert url == "https://temporary.googlevideo.com/video.mp4"
-    assert "youtube:player_client=default,web_embedded" in captured_command
+    assert "youtube:player_client=default" in captured_command
+    assert "youtube:player_client=default,web_embedded" not in captured_command
     assert "--get-url" in captured_command
 
 
