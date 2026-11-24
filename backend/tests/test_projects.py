@@ -544,6 +544,38 @@ def test_confidence_uses_distance_from_the_second_best_candidate() -> None:
     assert ambiguous_confidence < AudioMatchingService.minimum_score
 
 
+def test_overlapping_audio_windows_do_not_reduce_match_uniqueness() -> None:
+    import numpy as np
+
+    scores = np.full(100, 0.10)
+    scores[40] = 0.35
+    scores[49] = 0.34  # Still overlaps the 16-frame winner by almost half.
+
+    confidence = AudioMatchingService._calibrate_match_confidence(
+        scores,
+        best_frame=40,
+        reference_frame_count=16,
+    )
+
+    assert confidence >= AudioMatchingService.minimum_score
+
+
+def test_repeated_non_overlapping_audio_still_counts_as_ambiguous() -> None:
+    import numpy as np
+
+    scores = np.full(100, 0.10)
+    scores[20] = 0.35
+    scores[40] = 0.34  # More than one full reference window away.
+
+    confidence = AudioMatchingService._calibrate_match_confidence(
+        scores,
+        best_frame=20,
+        reference_frame_count=16,
+    )
+
+    assert confidence < AudioMatchingService.minimum_score
+
+
 def test_tempo_search_reuses_source_fft(monkeypatch: pytest.MonkeyPatch) -> None:
     import numpy as np
 

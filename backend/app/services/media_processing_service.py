@@ -697,7 +697,10 @@ class AudioMatchingService:
         reference_frame_count: int,
     ) -> float:
         best_score = float(np.clip(scores[best_frame], 0.0, 1.0))
-        exclusion_radius = max(1, reference_frame_count // 2)
+        # Sliding windows that overlap the winning clip are correlated by design.
+        # They are not independent alternatives and can otherwise make a clear match
+        # look ambiguous, especially for sustained speech or music.
+        exclusion_radius = max(1, reference_frame_count)
         left_scores = scores[: max(0, best_frame - exclusion_radius)]
         right_scores = scores[min(scores.size, best_frame + exclusion_radius + 1) :]
         alternatives = [candidate for candidate in (left_scores, right_scores) if candidate.size]
