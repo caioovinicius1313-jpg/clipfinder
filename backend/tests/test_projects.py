@@ -111,6 +111,52 @@ def test_youtube_download_retries_with_default_clients_when_formats_are_unavaila
     assert "--extractor-args" not in calls[1]
 
 
+def test_youtube_reference_download_relaxes_format_after_client_retry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[list[str]] = []
+    monkeypatch.setattr(settings, "youtube_cookies_base64", None)
+    monkeypatch.setattr(settings, "youtube_cookies_file", None)
+    monkeypatch.setattr(settings, "youtube_cookies_from_browser", None)
+    monkeypatch.setattr(settings, "ffmpeg_path", None)
+    monkeypatch.setattr("app.services.youtube_download_service.shutil.which", lambda _: None)
+
+    def fake_run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        calls.append(command)
+        if len(calls) < 3:
+            return subprocess.CompletedProcess(
+                args=command,
+                returncode=1,
+                stdout="",
+                stderr="ERROR: Requested format is not available",
+            )
+        downloaded_file = tmp_path / "reference.mp4"
+        downloaded_file.write_bytes(b"video")
+        return subprocess.CompletedProcess(
+            args=command,
+            returncode=0,
+            stdout=f"{downloaded_file}\n",
+            stderr="",
+        )
+
+    monkeypatch.setattr("app.services.youtube_download_service.subprocess.run", fake_run)
+
+    result = YoutubeDownloadService().download_video(
+        "abc123_DEF",
+        tmp_path,
+        filename_stem="reference",
+        reference_quality=True,
+    )
+
+    assert result == tmp_path / "reference.mp4"
+    assert len(calls) == 3
+    format_values = [command[command.index("--format") + 1] for command in calls]
+    assert format_values[0] == format_values[1]
+    assert "worstvideo[height<=480]+bestaudio" in format_values[0]
+    assert format_values[2] == "best[height<=480]/best"
+
+
 def test_automation_search_and_selection_routes(
     client: TestClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -116,13 +116,25 @@ class YoutubeDownloadService:
 
         if result.returncode != 0 and self._is_unavailable_format_error(result.stderr):
             # YouTube does not expose the same formats to every player client.
-            # Let yt-dlp select its current defaults once before failing the run.
+            # Retry without the explicit player, then relax the format constraint.
             fallback_command = self._build_download_command(
                 video_id,
                 destination_directory,
                 output_template=output_template,
                 reference_quality=reference_quality,
                 use_configured_clients=False,
+            )
+            result = self._run_download_command(fallback_command)
+            downloaded_path = self._downloaded_path(result.stdout)
+
+        if result.returncode != 0 and self._is_unavailable_format_error(result.stderr):
+            fallback_command = self._build_download_command(
+                video_id,
+                destination_directory,
+                output_template=output_template,
+                reference_quality=reference_quality,
+                use_configured_clients=False,
+                format_selector=self._fallback_format_selector(reference_quality),
             )
             result = self._run_download_command(fallback_command)
             downloaded_path = self._downloaded_path(result.stdout)
@@ -139,7 +151,9 @@ class YoutubeDownloadService:
         output_template: Path,
         reference_quality: bool,
         use_configured_clients: bool,
+        format_selector: str | None = None,
     ) -> list[str]:
+        selected_format = format_selector or self._format_selector(reference_quality)
         command = [
             sys.executable,
             "-m",
@@ -148,11 +162,7 @@ class YoutubeDownloadService:
             "--no-playlist",
             "--no-warnings",
             "--format",
-            (
-                "worst[height<=480]/worst"
-                if reference_quality
-                else "bestvideo*+bestaudio/best"
-            ),
+            selected_format,
             "--merge-output-format",
             "mp4",
         ]
@@ -178,6 +188,23 @@ class YoutubeDownloadService:
         self._add_javascript_runtime(command)
         command.append(f"https://www.youtube.com/watch?v={video_id}")
         return command
+
+    @staticmethod
+    def _format_selector(reference_quality: bool) -> str:
+        if reference_quality:
+            # Prefer a small video-only stream plus audio, but also support
+            # videos that expose only a muxed stream or higher resolutions.
+            return (
+                "worstvideo[height<=480]+bestaudio/"
+                "worst[height<=480]/worstvideo+bestaudio/worst"
+            )
+        return "bestvideo*+bestaudio/best"
+
+    @staticmethod
+    def _fallback_format_selector(reference_quality: bool) -> str:
+        if reference_quality:
+            return "best[height<=480]/best"
+        return "best"
 
     @staticmethod
     def _run_download_command(command: list[str]) -> subprocess.CompletedProcess[str]:
