@@ -1,4 +1,4 @@
-FROM node:22-bookworm-slim AS node_runtime
+FROM denoland/deno:bin-2.9.8 AS deno_runtime
 
 FROM python:3.12-slim
 
@@ -7,10 +7,9 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
-# yt-dlp needs a supported JavaScript runtime to solve YouTube's current
-# player challenges. Copy the matching Node 22 runtime into the Python image.
-COPY --from=node_runtime /usr/local/bin/node /usr/local/bin/node
-COPY --from=node_runtime /usr/local/lib/node_modules /usr/local/lib/node_modules
+# yt-dlp recommends Deno for solving YouTube's JavaScript player challenges.
+COPY --from=deno_runtime /deno /usr/local/bin/deno
+RUN deno --version
 
 RUN apt-get update \
     && apt-get install --no-install-recommends -y ffmpeg \
@@ -18,6 +17,7 @@ RUN apt-get update \
 
 COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
+RUN python -c "import importlib.metadata as m; print('yt-dlp', m.version('yt-dlp')); print('yt-dlp-ejs', m.version('yt-dlp-ejs'))"
 
 COPY . .
 RUN mkdir -p /app/storage

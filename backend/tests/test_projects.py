@@ -68,7 +68,21 @@ def test_youtube_download_can_use_browser_cookies_and_node_runtime(
     assert "--cookies-from-browser" in command
     assert command[command.index("--cookies-from-browser") + 1] == "edge"
     assert "--js-runtimes" in command
-    assert "--remote-components" in command
+    assert command[command.index("--js-runtimes") + 1] == (
+        "node:C:/Program Files/nodejs/node.exe"
+    )
+
+
+def test_youtube_download_prefers_deno_runtime(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "app.services.youtube_download_service.shutil.which",
+        lambda executable: "/usr/local/bin/deno" if executable == "deno" else None,
+    )
+    command: list[str] = []
+
+    YoutubeDownloadService._add_javascript_runtime(command)
+
+    assert command == ["--js-runtimes", "deno:/usr/local/bin/deno"]
 
 
 def test_youtube_download_retries_with_default_clients_when_formats_are_unavailable(

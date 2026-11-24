@@ -310,16 +310,14 @@ class YoutubeDownloadService:
 
     @staticmethod
     def _add_javascript_runtime(command: list[str]) -> None:
+        deno_path = shutil.which("deno")
+        if deno_path:
+            command.extend(["--js-runtimes", f"deno:{deno_path}"])
+            return
+
         node_path = shutil.which("node")
         if node_path:
-            command.extend(
-                [
-                    "--js-runtimes",
-                    f"node:{node_path}",
-                    "--remote-components",
-                    "ejs:github",
-                ]
-            )
+            command.extend(["--js-runtimes", f"node:{node_path}"])
 
     @staticmethod
     def _raise_download_error(stderr: str) -> None:
