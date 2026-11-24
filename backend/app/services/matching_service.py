@@ -170,8 +170,10 @@ class MatchingService:
             output_path=output_path,
             segments=[(match.source_start_seconds, match.duration_seconds) for match in matches],
         )
-        start_seconds = matches[0].source_start_seconds
-        end_seconds = matches[-1].source_start_seconds + matches[-1].duration_seconds
+        start_seconds = min(match.source_start_seconds for match in matches)
+        end_seconds = max(
+            match.source_start_seconds + match.duration_seconds for match in matches
+        )
         total_reference_duration = sum(
             match.reference_duration_seconds or match.duration_seconds for match in matches
         )

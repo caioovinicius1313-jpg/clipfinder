@@ -3,6 +3,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+from bisect import bisect_right
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -579,7 +580,7 @@ class AudioMatchingService:
             )
 
         return (
-            self._select_chronological_matches(candidates),
+            self._select_non_overlapping_source_matches(candidates),
             max(best_scores, default=0.0),
         )
 
@@ -1152,6 +1153,65 @@ class AudioMatchingService:
 
         matches.reverse()
         return matches
+
+    @staticmethod
+    def _select_non_overlapping_source_matches(
+        candidates: list[AudioSegmentMatch],
+    ) -> list[AudioSegmentMatch]:
+        """Choose the largest non-overlapping source set, even if the reference is reordered."""
+        if not candidates:
+            return []
+
+        ordered = sorted(
+            candidates,
+            key=lambda match: (
+                match.source_start_seconds + match.duration_seconds,
+                match.source_start_seconds,
+                match.reference_start_seconds,
+            ),
+        )
+        source_ends = [
+            match.source_start_seconds + match.duration_seconds for match in ordered
+        ]
+        best: list[tuple[float, float]] = [(0.0, 0.0)]
+        compatible_counts: list[int] = []
+        take_current: list[bool] = []
+
+        for index, match in enumerate(ordered):
+            compatible_count = bisect_right(
+                source_ends,
+                match.source_start_seconds + 0.25,
+                hi=index,
+            )
+            compatible_counts.append(compatible_count)
+            reference_duration = match.reference_duration_seconds or match.duration_seconds
+            previous_coverage, previous_confidence = best[compatible_count]
+            take_value = (
+                previous_coverage + reference_duration,
+                previous_confidence + (reference_duration * match.score),
+            )
+            skip_value = best[-1]
+            take_wins = take_value[0] > skip_value[0] + 1e-9 or (
+                abs(take_value[0] - skip_value[0]) <= 1e-9
+                and take_value[1] > skip_value[1]
+            )
+            take_current.append(take_wins)
+            best.append(take_value if take_wins else skip_value)
+
+        selected: list[AudioSegmentMatch] = []
+        index = len(ordered)
+        while index > 0:
+            candidate_index = index - 1
+            if take_current[candidate_index]:
+                selected.append(ordered[candidate_index])
+                index = compatible_counts[candidate_index]
+            else:
+                index -= 1
+
+        # Keep the reference's sequence when rebuilding a montage; source and
+        # reference order are not necessarily the same after social-media edits.
+        selected.sort(key=lambda match: match.reference_start_seconds)
+        return selected
 
     @staticmethod
     def _normalize(values: np.ndarray) -> np.ndarray:

@@ -38,6 +38,7 @@ from app.services.media_processing_service import (
     MediaProcessingError,
     MediaProcessingService,
 )
+from app.services.matching_service import MatchingService
 from app.services.multipart_upload_service import MultipartUploadService
 from app.services.storage_service import StorageService
 from app.services.youtube_download_service import YoutubeDownloadError, YoutubeDownloadService
@@ -834,6 +835,83 @@ def test_fine_offset_scans_find_audio_across_unaligned_reference_edits(
     assert coarse_coverage < required_coverage
     assert fine_coverage >= required_coverage
     assert len(matches) >= 6
+
+
+def test_segmented_matching_keeps_reordered_reference_segments(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import numpy as np
+
+    matching_service = AudioMatchingService()
+    generator = np.random.default_rng(20261124)
+    source_features = generator.normal(size=(2_400, 32)).astype(np.float32)
+    source_features[:, 0] = np.arange(source_features.shape[0])
+    source_segment_starts = (1_200, 100, 1_800, 600)
+    segment_frames = 8 * matching_service.feature_rate
+    reference_features = np.concatenate(
+        [
+            source_features[start : start + segment_frames]
+            for start in source_segment_starts
+        ]
+    )
+
+    def find_known_segments(
+        _source: np.ndarray,
+        reference: np.ndarray,
+        *,
+        search_indexes: object,
+    ) -> tuple[int, float, float]:
+        del search_indexes
+        contains_edit = bool(np.any(np.abs(np.diff(reference[:, 0])) > 10))
+        return (
+            round(float(reference[0, 0])),
+            0.1 if contains_edit else 0.95,
+            1.0,
+        )
+
+    monkeypatch.setattr(matching_service, "_find_best_tempo_match", find_known_segments)
+
+    matches = matching_service.find_segmented_matches_in_features(
+        source_features,
+        reference_features,
+    )
+
+    assert [round(match.source_start_seconds) for match in matches] == [60, 5, 90, 30]
+    assert [round(match.reference_start_seconds) for match in matches] == [0, 8, 16, 24]
+    assert matching_service._matched_reference_duration(matches) == 32
+
+
+def test_reordered_match_montage_keeps_reference_order_and_source_bounds() -> None:
+    matches = [
+        AudioSegmentMatch(60, 0, 8, 0.9, 8),
+        AudioSegmentMatch(5, 8, 8, 0.8, 8),
+        AudioSegmentMatch(90, 16, 8, 0.95, 8),
+        AudioSegmentMatch(30, 24, 8, 0.85, 8),
+    ]
+
+    class FakeAudioMatcher:
+        def __init__(self) -> None:
+            self.segments: list[tuple[float, float]] = []
+            self.media_service = self
+
+        def find_matches(self, _source_path: str, _reference_path: str):
+            return matches
+
+        def generate_montage(self, **kwargs: object) -> None:
+            self.segments = kwargs["segments"]  # type: ignore[assignment]
+
+    audio_matcher = FakeAudioMatcher()
+    matching_service = MatchingService(audio_matching_service=audio_matcher)  # type: ignore[arg-type]
+
+    start, end, score = matching_service._generate_matched_clip(
+        source_path="source.mp4",
+        reference_path="reference.mp4",
+        output_path=Path("montage.mp4"),
+    )
+
+    assert audio_matcher.segments == [(60, 8), (5, 8), (90, 8), (30, 8)]
+    assert (start, end) == (5, 98)
+    assert score == pytest.approx(0.875)
 
 
 def test_waveform_refinement_finds_precise_offset() -> None:
