@@ -40,7 +40,7 @@ from app.services.media_processing_service import (
 )
 from app.services.multipart_upload_service import MultipartUploadService
 from app.services.storage_service import StorageService
-from app.services.youtube_download_service import YoutubeDownloadService
+from app.services.youtube_download_service import YoutubeDownloadError, YoutubeDownloadService
 from app.services.youtube_service import YoutubeService
 
 
@@ -124,7 +124,7 @@ def test_youtube_reference_download_relaxes_format_after_client_retry(
 
     def fake_run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
         calls.append(command)
-        if len(calls) < 3:
+        if len(calls) < 5:
             return subprocess.CompletedProcess(
                 args=command,
                 returncode=1,
@@ -150,11 +150,23 @@ def test_youtube_reference_download_relaxes_format_after_client_retry(
     )
 
     assert result == tmp_path / "reference.mp4"
-    assert len(calls) == 3
+    assert len(calls) == 5
     format_values = [command[command.index("--format") + 1] for command in calls]
-    assert format_values[0] == format_values[1]
+    assert format_values[0] == format_values[1] == format_values[2]
     assert "worstvideo[height<=480]+bestaudio" in format_values[0]
-    assert format_values[2] == "best[height<=480]/best"
+    assert "--extractor-args" not in calls[1]
+    assert calls[2][calls[2].index("--extractor-args") + 1] == (
+        "youtube:player_client=web_embedded"
+    )
+    assert format_values[3] == format_values[4] == "best[height<=480]/best"
+
+
+def test_youtube_download_reports_javascript_challenge_when_formats_are_missing() -> None:
+    with pytest.raises(YoutubeDownloadError, match="desafio JavaScript"):
+        YoutubeDownloadService._raise_download_error(
+            "WARNING: No supported JavaScript runtime could be found. Formats may be missing.\n"
+            "ERROR: Requested format is not available"
+        )
 
 
 def test_automation_search_and_selection_routes(
