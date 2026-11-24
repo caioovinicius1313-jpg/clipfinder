@@ -320,6 +320,7 @@ class AudioMatchingService:
     minimum_score = 0.45
     minimum_segment_score = 0.30
     segment_seconds = 8
+    fine_segment_seconds = 4
     minimum_segment_seconds = 3
     analysis_sample_rate = 4_000
     feature_rate = 20
@@ -482,12 +483,74 @@ class AudioMatchingService:
         if reference_features.shape[0] >= source_features.shape[0]:
             raise MediaProcessingError("O vídeo de referência precisa ser menor que o vídeo original.")
 
-        segment_frames = self.segment_seconds * self.feature_rate
+        indexes = search_indexes or self._build_feature_search_indexes(source_features)
+        reference_duration = reference_features.shape[0] / self.feature_rate
+        required_coverage = min(
+            reference_duration,
+            max(
+                float(self.minimum_segment_seconds),
+                reference_duration * self.minimum_reference_coverage,
+            ),
+        )
+
+        # Keep the fast, high-context pass first. If its rigid 8-second borders
+        # cross edits in a montage, retry with two offset 4-second grids. Each
+        # grid is non-overlapping, so accepted coverage cannot be double-counted.
+        scans = [
+            self._scan_reference_segments(
+                source_features,
+                reference_features,
+                segment_seconds=self.segment_seconds,
+                offset_seconds=0,
+                search_indexes=indexes,
+            )
+        ]
+        if self._matched_reference_duration(scans[0][0]) < required_coverage:
+            for offset_seconds in (0, self.fine_segment_seconds / 2):
+                scans.append(
+                    self._scan_reference_segments(
+                        source_features,
+                        reference_features,
+                        segment_seconds=self.fine_segment_seconds,
+                        offset_seconds=offset_seconds,
+                        search_indexes=indexes,
+                    )
+                )
+
+        selected_matches, best_score = max(
+            scans,
+            key=lambda scan: (
+                self._matched_reference_duration(scan[0]),
+                sum(match.score for match in scan[0]),
+            ),
+        )
+        self._validate_reference_coverage(
+            selected_matches,
+            reference_duration,
+            best_score=best_score,
+        )
+        return selected_matches
+
+    def _scan_reference_segments(
+        self,
+        source_features: np.ndarray,
+        reference_features: np.ndarray,
+        *,
+        segment_seconds: float,
+        offset_seconds: float,
+        search_indexes: tuple[FeatureSearchIndex, FeatureSearchIndex],
+    ) -> tuple[list[AudioSegmentMatch], float]:
+        segment_frames = round(segment_seconds * self.feature_rate)
         minimum_frames = self.minimum_segment_seconds * self.feature_rate
+        offset_frames = round(offset_seconds * self.feature_rate)
         candidates: list[AudioSegmentMatch] = []
         best_scores: list[float] = []
-        indexes = search_indexes or self._build_feature_search_indexes(source_features)
-        for reference_start_frame in range(0, reference_features.shape[0], segment_frames):
+
+        for reference_start_frame in range(
+            offset_frames,
+            reference_features.shape[0],
+            segment_frames,
+        ):
             reference_segment = reference_features[
                 reference_start_frame : reference_start_frame + segment_frames
             ]
@@ -497,30 +560,34 @@ class AudioMatchingService:
             source_start_frame, score, tempo_factor = self._find_best_tempo_match(
                 source_features,
                 reference_segment,
-                search_indexes=indexes,
+                search_indexes=search_indexes,
             )
             best_scores.append(score)
-            if score >= self.minimum_segment_score:
-                reference_duration_seconds = reference_segment.shape[0] / self.feature_rate
-                candidates.append(
-                    AudioSegmentMatch(
-                        source_start_seconds=source_start_frame / self.feature_rate,
-                        reference_start_seconds=reference_start_frame / self.feature_rate,
-                        duration_seconds=reference_duration_seconds * tempo_factor,
-                        score=score,
-                        reference_duration_seconds=reference_duration_seconds,
-                        tempo_factor=tempo_factor,
-                    )
-                )
+            if score < self.minimum_segment_score:
+                continue
 
-        selected_matches = self._select_chronological_matches(candidates)
-        reference_duration = reference_features.shape[0] / self.feature_rate
-        self._validate_reference_coverage(
-            selected_matches,
-            reference_duration,
-            best_score=max(best_scores, default=0.0),
+            reference_duration_seconds = reference_segment.shape[0] / self.feature_rate
+            candidates.append(
+                AudioSegmentMatch(
+                    source_start_seconds=source_start_frame / self.feature_rate,
+                    reference_start_seconds=reference_start_frame / self.feature_rate,
+                    duration_seconds=reference_duration_seconds * tempo_factor,
+                    score=score,
+                    reference_duration_seconds=reference_duration_seconds,
+                    tempo_factor=tempo_factor,
+                )
+            )
+
+        return (
+            self._select_chronological_matches(candidates),
+            max(best_scores, default=0.0),
         )
-        return selected_matches
+
+    @staticmethod
+    def _matched_reference_duration(matches: list[AudioSegmentMatch]) -> float:
+        return sum(
+            match.reference_duration_seconds or match.duration_seconds for match in matches
+        )
 
     def _find_best_tempo_match(
         self,

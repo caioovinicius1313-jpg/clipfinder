@@ -781,6 +781,58 @@ def test_segmented_matching_reconstructs_non_contiguous_reference() -> None:
     assert all(match.score > 0.99 for match in matches)
 
 
+def test_fine_offset_scans_find_audio_across_unaligned_reference_edits(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import numpy as np
+
+    matching_service = AudioMatchingService()
+    generator = np.random.default_rng(2026)
+    source_features = generator.normal(size=(2_000, 32)).astype(np.float32)
+    source_features[:, 0] = np.arange(source_features.shape[0])
+    reference_features = np.concatenate(
+        [source_features[start : start + 200] for start in (200, 600, 1_000, 1_400)]
+    )
+
+    def score_unedited_reference_windows(
+        _source: np.ndarray,
+        reference: np.ndarray,
+        *,
+        search_indexes: object,
+    ) -> tuple[int, float, float]:
+        del search_indexes
+        has_edit = bool(np.any(np.abs(np.diff(reference[:, 0])) > 10))
+        return round(float(reference[0, 0])), 0.1 if has_edit else 0.95, 1.0
+
+    monkeypatch.setattr(
+        matching_service,
+        "_find_best_tempo_match",
+        score_unedited_reference_windows,
+    )
+    search_indexes = matching_service._build_feature_search_indexes(source_features)
+
+    coarse_matches, _ = matching_service._scan_reference_segments(
+        source_features,
+        reference_features,
+        segment_seconds=matching_service.segment_seconds,
+        offset_seconds=0,
+        search_indexes=search_indexes,
+    )
+    coarse_coverage = matching_service._matched_reference_duration(coarse_matches)
+
+    matches = matching_service.find_segmented_matches_in_features(
+        source_features,
+        reference_features,
+        search_indexes=search_indexes,
+    )
+    fine_coverage = matching_service._matched_reference_duration(matches)
+
+    required_coverage = reference_features.shape[0] / matching_service.feature_rate * 0.6
+    assert coarse_coverage < required_coverage
+    assert fine_coverage >= required_coverage
+    assert len(matches) >= 6
+
+
 def test_waveform_refinement_finds_precise_offset() -> None:
     import numpy as np
 
