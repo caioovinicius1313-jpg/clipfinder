@@ -111,44 +111,25 @@ class YoutubeDownloadService:
             reference_quality=reference_quality,
             use_configured_clients=True,
         )
-        format_selectors = (
-            self._format_selector(reference_quality),
-            self._fallback_format_selector(reference_quality),
-        )
-        stderr_history: list[str] = []
         result = self._run_download_command(command)
         downloaded_path = self._downloaded_path(result.stdout)
-        if result.returncode == 0 and downloaded_path is not None:
-            return downloaded_path
-        stderr_history.append(result.stderr)
 
-        # Format availability can differ by YouTube player. The embed client
-        # provides a separate supported route for videos that allow embedding.
-        attempts = [
-            (format_selectors[0], None, False),
-            (format_selectors[0], "youtube:player_client=web_embedded", False),
-            (format_selectors[1], None, False),
-            (format_selectors[1], "youtube:player_client=web_embedded", False),
-        ]
-        for format_selector, player_client, use_configured_clients in attempts:
+        if result.returncode != 0 and self._is_unavailable_format_error(result.stderr):
+            # YouTube may expose different formats to its player clients.
+            # Retry once with yt-dlp's own default client selection.
             fallback_command = self._build_download_command(
                 video_id,
                 destination_directory,
                 output_template=output_template,
                 reference_quality=reference_quality,
-                use_configured_clients=use_configured_clients,
-                player_client=player_client,
-                format_selector=format_selector,
+                use_configured_clients=False,
             )
             result = self._run_download_command(fallback_command)
             downloaded_path = self._downloaded_path(result.stdout)
-            if result.returncode == 0 and downloaded_path is not None:
-                return downloaded_path
-            stderr_history.append(result.stderr)
-            if not self._is_unavailable_format_error(result.stderr):
-                self._raise_download_error("\n".join(stderr_history))
 
-        self._raise_download_error("\n".join(stderr_history))
+        if result.returncode != 0 or downloaded_path is None:
+            self._raise_download_error(result.stderr)
+        return downloaded_path
 
     def _build_download_command(
         self,
@@ -158,24 +139,24 @@ class YoutubeDownloadService:
         output_template: Path,
         reference_quality: bool,
         use_configured_clients: bool,
-        format_selector: str | None = None,
-        player_client: str | None = None,
     ) -> list[str]:
-        selected_format = format_selector or self._format_selector(reference_quality)
         command = [
             sys.executable,
             "-m",
             "yt_dlp",
             "--no-config",
             "--no-playlist",
+            "--no-warnings",
             "--format",
-            selected_format,
+            (
+                "worst[height<=480]/worst"
+                if reference_quality
+                else "bestvideo*+bestaudio/best"
+            ),
             "--merge-output-format",
             "mp4",
         ]
-        if player_client is not None:
-            command.extend(["--extractor-args", player_client])
-        elif use_configured_clients:
+        if use_configured_clients:
             command.extend(["--extractor-args", self.extractor_args])
         command.extend(
             [
@@ -197,23 +178,6 @@ class YoutubeDownloadService:
         self._add_javascript_runtime(command)
         command.append(f"https://www.youtube.com/watch?v={video_id}")
         return command
-
-    @staticmethod
-    def _format_selector(reference_quality: bool) -> str:
-        if reference_quality:
-            # Prefer a small video-only stream plus audio, but also support
-            # videos that expose only a muxed stream or higher resolutions.
-            return (
-                "worstvideo[height<=480]+bestaudio/"
-                "worst[height<=480]/worstvideo+bestaudio/worst"
-            )
-        return "bestvideo*+bestaudio/best"
-
-    @staticmethod
-    def _fallback_format_selector(reference_quality: bool) -> str:
-        if reference_quality:
-            return "best[height<=480]/best"
-        return "best"
 
     @staticmethod
     def _run_download_command(command: list[str]) -> subprocess.CompletedProcess[str]:
@@ -310,23 +274,24 @@ class YoutubeDownloadService:
 
     @staticmethod
     def _add_javascript_runtime(command: list[str]) -> None:
-        deno_path = shutil.which("deno")
-        if deno_path:
-            command.extend(["--js-runtimes", f"deno:{deno_path}"])
-            return
-
         node_path = shutil.which("node")
         if node_path:
-            command.extend(["--js-runtimes", f"node:{node_path}"])
+            command.extend(
+                [
+                    "--js-runtimes",
+                    f"node:{node_path}",
+                    "--remote-components",
+                    "ejs:github",
+                ]
+            )
 
     @staticmethod
     def _raise_download_error(stderr: str) -> None:
         detail = stderr.strip().splitlines()
         message = detail[-1] if detail else "O YouTube não disponibilizou o arquivo."
-        lowered_stderr = stderr.lower()
         bot_challenge = (
-            "sign in to confirm you’re not a bot" in lowered_stderr
-            or "sign in to confirm you're not a bot" in lowered_stderr
+            "Sign in to confirm you’re not a bot" in message
+            or "Sign in to confirm you're not a bot" in message
         )
         if bot_challenge:
             if settings.youtube_cookies_base64:
@@ -337,25 +302,5 @@ class YoutubeDownloadService:
             raise YoutubeDownloadError(
                 "O YouTube bloqueou o servidor contra automação. Configure "
                 "YOUTUBE_COOKIES_BASE64 para autorizar os downloads."
-            )
-        javascript_challenge = any(
-            marker in lowered_stderr
-            for marker in (
-                "no supported javascript runtime",
-                "challenge solving failed",
-                "formats may be missing",
-                "n challenge solving failed",
-            )
-        )
-        if javascript_challenge:
-            raise YoutubeDownloadError(
-                "O yt-dlp não conseguiu resolver o desafio JavaScript do YouTube; por isso, a lista "
-                "de formatos veio incompleta. Confira Node e os componentes EJS nos logs do backend."
-            )
-        if "requested format is not available" in lowered_stderr:
-            raise YoutubeDownloadError(
-                "O YouTube não disponibilizou um formato compatível após as tentativas com os "
-                "players padrão e de incorporação. O vídeo pode exigir uma sessão autorizada ou "
-                "estar temporariamente sem formatos acessíveis."
             )
         raise YoutubeDownloadError(message[-600:])
