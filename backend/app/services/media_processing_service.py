@@ -36,6 +36,13 @@ class AudioSegmentMatch:
     alignment_confirmation_score: float | None = None
 
 
+@dataclass(frozen=True)
+class ShortWindowMatchCandidate:
+    source_start_frame: int
+    similarity_score: float
+    local_confidence: float
+
+
 @dataclass
 class FeatureSearchIndex:
     normalized_features: np.ndarray
@@ -977,7 +984,8 @@ class AudioMatchingService:
         scene_edges.append(reference_frames)
 
         matches: list[AudioSegmentMatch] = []
-        best_score = 0.0
+        ambiguous_match_indexes: set[int] = set()
+        best_local_confidence = 0.0
         candidate_windows: list[list[AudioSegmentMatch]] = []
         for scene_start, scene_end in zip(scene_edges[:-1], scene_edges[1:], strict=True):
             scene_length = scene_end - scene_start
@@ -1001,18 +1009,30 @@ class AudioMatchingService:
                     limit=self.concordance_top_candidates,
                 )
                 window_matches: list[AudioSegmentMatch] = []
-                for source_start_frame, score in top_candidates:
-                    best_score = max(best_score, score)
-                    if score < self.concordance_minimum_score:
+                for candidate in top_candidates:
+                    best_local_confidence = max(
+                        best_local_confidence,
+                        candidate.local_confidence,
+                    )
+                    # A short window can be locally ambiguous (for example, repeated
+                    # speech or a common phrase) while still belonging to a unique,
+                    # coherent timeline across neighboring windows. Keep raw
+                    # similarity for the concordance tree and use the calibrated
+                    # confidence only as local evidence; rejecting on local
+                    # confidence here prevents the tree from ever confirming it.
+                    if candidate.similarity_score < self.concordance_minimum_score:
                         continue
                     duration = scene_window_frames / feature_rate
                     window_matches.append(
                         AudioSegmentMatch(
-                            source_start_seconds=source_start_frame / feature_rate,
+                            source_start_seconds=(
+                                candidate.source_start_frame / feature_rate
+                            ),
                             reference_start_seconds=reference_start_frame / feature_rate,
                             duration_seconds=duration,
-                            score=score,
+                            score=candidate.similarity_score,
                             reference_duration_seconds=duration,
+                            alignment_confirmation_score=candidate.local_confidence,
                         )
                     )
                 candidate_windows.append(window_matches)
@@ -1044,29 +1064,73 @@ class AudioMatchingService:
                 average_score >= self.minimum_average_match_score
                 and 0.8 <= tempo_factor <= 1.2
             ):
-                matches.append(
-                    AudioSegmentMatch(
-                        source_start_seconds=first.source_start_seconds,
-                        reference_start_seconds=reference_start,
-                        duration_seconds=reference_duration * tempo_factor,
-                        score=average_score,
-                        reference_duration_seconds=reference_duration,
-                        tempo_factor=tempo_factor,
-                    )
+                path_local_confidence = sum(
+                    candidate.alignment_confirmation_score
+                    if candidate.alignment_confirmation_score is not None
+                    else candidate.score
+                    for candidate in path
+                ) / len(path)
+                candidate_match = AudioSegmentMatch(
+                    source_start_seconds=first.source_start_seconds,
+                    reference_start_seconds=reference_start,
+                    duration_seconds=reference_duration * tempo_factor,
+                    score=average_score,
+                    reference_duration_seconds=reference_duration,
+                    tempo_factor=tempo_factor,
+                    alignment_confirmation_score=path_local_confidence,
                 )
+                for match_index, previous_match in enumerate(matches):
+                    overlap = max(
+                        0.0,
+                        min(
+                            reference_end,
+                            previous_match.reference_start_seconds
+                            + (
+                                previous_match.reference_duration_seconds
+                                or previous_match.duration_seconds
+                            ),
+                        )
+                        - max(reference_start, previous_match.reference_start_seconds),
+                    )
+                    shorter_duration = min(
+                        reference_duration,
+                        previous_match.reference_duration_seconds
+                        or previous_match.duration_seconds,
+                    )
+                    source_separation = abs(
+                        first.source_start_seconds - previous_match.source_start_seconds
+                    )
+                    if (
+                        shorter_duration > 0
+                        and overlap / shorter_duration >= 0.5
+                        and source_separation > max(1.0, shorter_duration * 0.1)
+                        and abs(average_score - previous_match.score) <= 0.05
+                    ):
+                        ambiguous_match_indexes.add(match_index)
+                        ambiguous_match_indexes.add(len(matches))
+                matches.append(candidate_match)
 
-            # Consume the reference interval whether or not this path passed its
-            # quality gate, then search the remaining scenes for other source runs.
+            # Remove this source trajectory, not the whole reference interval. This
+            # lets the tree compare alternate source locations for the same clip and
+            # reject genuinely ambiguous repeated audio instead of silently picking
+            # the first occurrence.
             changed = False
             for index, window in enumerate(remaining_windows):
                 retained = [
                     candidate
                     for candidate in window
-                    if (
-                        candidate.reference_start_seconds
-                        + (candidate.reference_duration_seconds or candidate.duration_seconds)
-                        <= reference_start
-                        or candidate.reference_start_seconds >= reference_end
+                    if not any(
+                        abs(
+                            candidate.reference_start_seconds
+                            - path_candidate.reference_start_seconds
+                        )
+                        <= max(step_frames / feature_rate, 0.5)
+                        and abs(
+                            candidate.source_start_seconds
+                            - path_candidate.source_start_seconds
+                        )
+                        <= 1.0
+                        for path_candidate in path
                     )
                 ]
                 if len(retained) != len(window):
@@ -1075,6 +1139,16 @@ class AudioMatchingService:
             if not changed:
                 break
 
+        matches = [
+            match
+            for index, match in enumerate(matches)
+            if index not in ambiguous_match_indexes
+        ]
+        best_score = (
+            max(match.score for match in matches)
+            if matches
+            else best_local_confidence
+        )
         return self._select_non_overlapping_reference_matches(matches), best_score
 
     def _find_top_short_window_candidates(
@@ -1083,7 +1157,7 @@ class AudioMatchingService:
         reference_features: np.ndarray,
         *,
         limit: int,
-    ) -> list[tuple[int, float]]:
+    ) -> list[ShortWindowMatchCandidate]:
         spectral_index, fingerprint_index = search_indexes
         spectral_scores = self._feature_match_scores(spectral_index, reference_features)
         reference_fingerprint = self._binary_fingerprint(reference_features)
@@ -1101,7 +1175,7 @@ class AudioMatchingService:
             1,
             round(self.concordance_window_seconds * self.feature_rate / 2),
         )
-        candidates: list[tuple[int, float]] = []
+        candidates: list[ShortWindowMatchCandidate] = []
         for _ in range(limit):
             frame = int(np.argmax(candidate_scores))
             raw_score = float(candidate_scores[frame])
@@ -1112,7 +1186,13 @@ class AudioMatchingService:
                 frame,
                 reference_features.shape[0],
             )
-            candidates.append((frame, confidence))
+            candidates.append(
+                ShortWindowMatchCandidate(
+                    source_start_frame=frame,
+                    similarity_score=raw_score,
+                    local_confidence=confidence,
+                )
+            )
             candidate_scores[
                 max(0, frame - suppression_radius) : frame + suppression_radius + 1
             ] = -np.inf

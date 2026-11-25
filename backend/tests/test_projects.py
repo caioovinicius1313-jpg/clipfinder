@@ -37,6 +37,7 @@ from app.services.media_processing_service import (
     MediaProbe,
     MediaProcessingError,
     MediaProcessingService,
+    ShortWindowMatchCandidate,
 )
 from app.services.multipart_upload_service import MultipartUploadService
 from app.services.storage_service import StorageService
@@ -1607,13 +1608,21 @@ def test_concordance_tree_prefers_consistent_branch_over_isolated_high_score(
         window: np.ndarray,
         *,
         limit: int,
-    ) -> list[tuple[int, float]]:
+    ) -> list[ShortWindowMatchCandidate]:
         del limit
         reference_start = round(float(window[0, 0]))
         observed_windows.append((reference_start, window.shape[0]))
         return [
-            (20 * matching_service.feature_rate + reference_start, 0.75),
-            (80 * matching_service.feature_rate, 0.99),
+            ShortWindowMatchCandidate(
+                source_start_frame=(20 * matching_service.feature_rate + reference_start),
+                similarity_score=0.75,
+                local_confidence=0.29,
+            ),
+            ShortWindowMatchCandidate(
+                source_start_frame=80 * matching_service.feature_rate,
+                similarity_score=0.99,
+                local_confidence=0.99,
+            ),
         ]
 
     monkeypatch.setattr(
@@ -1633,7 +1642,10 @@ def test_concordance_tree_prefers_consistent_branch_over_isolated_high_score(
     assert matches[0].source_start_seconds == pytest.approx(20)
     assert matches[0].duration_seconds == pytest.approx(8)
     assert matches[0].score == pytest.approx(0.75)
-    assert best_score == pytest.approx(0.99)
+    assert matches[0].alignment_confirmation_score == pytest.approx(0.29)
+    # The isolated 99% local peak is not a valid match. The coherent 75% path
+    # confirms the weaker-but-consistent local candidate across the full clip.
+    assert best_score == pytest.approx(0.75)
     assert observed_windows == [
         (start_frame, 2 * matching_service.feature_rate)
         for start_frame in range(
