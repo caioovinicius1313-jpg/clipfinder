@@ -505,16 +505,26 @@ class AudioMatchingService:
             return [contiguous_match]
 
         segmented_score = self._weighted_average_match_score(segmented_matches)
-        has_discontinuous_alignment = any(
-            abs(
+        total_reference_duration = self._matched_reference_duration(segmented_matches)
+        discontinuous_reference_duration = sum(
+            (match.reference_duration_seconds or match.duration_seconds)
+            for match in segmented_matches
+            if abs(
                 match.source_start_seconds
                 - (
                     contiguous_match.source_start_seconds
-                    + match.reference_start_seconds * contiguous_match.tempo_factor
+                    + (match.reference_start_seconds - contiguous_match.reference_start_seconds)
+                    * contiguous_match.tempo_factor
                 )
             )
             > max(0.5, (match.reference_duration_seconds or match.duration_seconds) * 0.08)
-            for match in segmented_matches
+        )
+        # A single short false-positive window must not turn an otherwise
+        # coherent reference into a montage. Require the disagreement to
+        # explain most of the reference, not merely one segment.
+        has_discontinuous_alignment = (
+            total_reference_duration > 0
+            and discontinuous_reference_duration / total_reference_duration > 0.5
         )
         if (
             len(segmented_matches) > 1

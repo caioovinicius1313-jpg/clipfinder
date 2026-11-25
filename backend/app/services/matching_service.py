@@ -165,15 +165,30 @@ class MatchingService:
         output_path: Path,
     ) -> tuple[float, float, float]:
         matches = self.audio_matching_service.find_matches(source_path, reference_path)
+        clip_segments = [
+            (match.source_start_seconds, match.duration_seconds) for match in matches
+        ]
+        # A contiguous match may begin after the reference's first seconds
+        # when leading audio is quiet or unlike the source. In that case the
+        # match start maps to reference_start_seconds, not to t=0. Restore
+        # the omitted prefix using the measured tempo, but only for a single
+        # contiguous match; extrapolating across a montage edit is unsafe.
+        if len(matches) == 1 and matches[0].reference_start_seconds > 0:
+            match = matches[0]
+            prefix_duration = match.reference_start_seconds * match.tempo_factor
+            expanded_start = match.source_start_seconds - prefix_duration
+            if expanded_start >= 0:
+                clip_segments[0] = (
+                    expanded_start,
+                    match.duration_seconds + prefix_duration,
+                )
         self.audio_matching_service.media_service.generate_montage(
             source_path=source_path,
             output_path=output_path,
-            segments=[(match.source_start_seconds, match.duration_seconds) for match in matches],
+            segments=clip_segments,
         )
-        start_seconds = min(match.source_start_seconds for match in matches)
-        end_seconds = max(
-            match.source_start_seconds + match.duration_seconds for match in matches
-        )
+        start_seconds = min(start for start, _duration in clip_segments)
+        end_seconds = max(start + duration for start, duration in clip_segments)
         total_reference_duration = sum(
             match.reference_duration_seconds or match.duration_seconds for match in matches
         )

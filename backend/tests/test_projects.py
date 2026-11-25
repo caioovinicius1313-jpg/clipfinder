@@ -39,6 +39,7 @@ from app.services.media_processing_service import (
     MediaProcessingService,
     ShortWindowMatchCandidate,
 )
+from app.services.matching_service import MatchingService
 from app.services.multipart_upload_service import MultipartUploadService
 from app.services.storage_service import StorageService
 from app.services.youtube_download_service import YoutubeDownloadError, YoutubeDownloadService
@@ -2380,6 +2381,78 @@ def test_find_matches_keeps_contiguous_alignment_when_scene_edits_are_only_visua
     matches = MatchingServiceWithVisualCuts().find_matches("source.mp4", "reference.mp4")
 
     assert matches == [contiguous_match]
+
+
+def test_find_matches_ignores_short_false_segment_when_rest_matches_contiguous_offset() -> None:
+    import numpy as np
+
+    analysis = AudioAnalysis(
+        source_samples=np.zeros(200_000),
+        reference_samples=np.zeros(300_000),
+        source_features=np.zeros((1_000, 48)),
+        reference_features=np.zeros((1_500, 48)),
+        reference_scene_boundaries=(4.58,),
+    )
+    # The contiguous match starts 3.5 s into the reference. The later segment
+    # maps to the same global offset; only the short initial segment is false.
+    contiguous_match = AudioSegmentMatch(536.073, 3.5, 11.249, 0.78, 11.2, 1.004)
+    segmented_matches = [
+        AudioSegmentMatch(530.390, 0.0, 4.612, 0.80, 4.583, 1.006),
+        AudioSegmentMatch(537.157, 4.583, 10.257, 0.82, 10.207, 1.005),
+    ]
+
+    class MatchingServiceWithFalsePrefix(AudioMatchingService):
+        def _load_analysis(self, source_path: str, reference_path: str) -> AudioAnalysis:
+            return analysis
+
+        def _find_contiguous_match(self, loaded: AudioAnalysis) -> AudioSegmentMatch:
+            return contiguous_match
+
+        def _find_segmented_matches_from_analysis(
+            self, loaded: AudioAnalysis
+        ) -> list[AudioSegmentMatch]:
+            return segmented_matches
+
+    matches = MatchingServiceWithFalsePrefix().find_matches("source.mp4", "reference.mp4")
+
+    assert matches == [contiguous_match]
+
+
+def test_generated_single_match_restores_reference_prefix_from_alignment_offset(
+    tmp_path: Path,
+) -> None:
+    from types import SimpleNamespace
+
+    match = AudioSegmentMatch(
+        source_start_seconds=536.073,
+        reference_start_seconds=3.5,
+        duration_seconds=11.249,
+        score=0.78,
+        reference_duration_seconds=11.2,
+        tempo_factor=1.004,
+    )
+    montage_calls: list[list[tuple[float, float]]] = []
+    fake_audio_service = SimpleNamespace(
+        find_matches=lambda *_args: [match],
+        media_service=SimpleNamespace(
+            generate_montage=lambda *, source_path, output_path, segments: montage_calls.append(
+                segments
+            )
+        ),
+    )
+    matching_service = MatchingService(audio_matching_service=fake_audio_service)
+
+    start, end, score = matching_service._generate_matched_clip(
+        source_path="source.mp4",
+        reference_path="reference.mp4",
+        output_path=tmp_path / "clip.mp4",
+    )
+
+    expected_start = 536.073 - (3.5 * 1.004)
+    assert montage_calls == [[(pytest.approx(expected_start), pytest.approx(14.763))]]
+    assert start == pytest.approx(expected_start)
+    assert end == pytest.approx(547.322)
+    assert score == pytest.approx(0.78)
 
 
 def test_audio_extraction_explains_when_file_has_no_audio(monkeypatch: pytest.MonkeyPatch) -> None:
