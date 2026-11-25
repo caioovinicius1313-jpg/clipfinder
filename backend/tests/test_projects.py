@@ -1656,6 +1656,65 @@ def test_concordance_tree_prefers_consistent_branch_over_isolated_high_score(
     ]
 
 
+def test_concordance_tree_keeps_long_path_over_a_repeated_partial_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import numpy as np
+
+    matching_service = AudioMatchingService()
+    generator = np.random.default_rng(20261124)
+    source_features = generator.normal(size=(2_400, 32)).astype(np.float32)
+    reference_features = np.zeros((8 * matching_service.feature_rate, 32), dtype=np.float32)
+    reference_features[:, 0] = np.arange(reference_features.shape[0])
+
+    def top_candidates(
+        _indexes: object,
+        window: np.ndarray,
+        *,
+        limit: int,
+    ) -> list[ShortWindowMatchCandidate]:
+        del limit
+        reference_start = round(float(window[0, 0]))
+        candidates = [
+            ShortWindowMatchCandidate(
+                source_start_frame=(20 * matching_service.feature_rate + reference_start),
+                similarity_score=0.75,
+                local_confidence=0.29,
+            )
+        ]
+        # A second coherent location exists only for the first half of the
+        # reference. It must not make the longer, better-supported path ambiguous.
+        if reference_start <= 3 * matching_service.feature_rate:
+            candidates.append(
+                ShortWindowMatchCandidate(
+                    source_start_frame=(
+                        80 * matching_service.feature_rate + reference_start
+                    ),
+                    similarity_score=0.74,
+                    local_confidence=0.30,
+                )
+            )
+        return candidates
+
+    monkeypatch.setattr(
+        matching_service,
+        "_find_top_short_window_candidates",
+        top_candidates,
+    )
+    indexes = matching_service._build_feature_search_indexes(source_features)
+
+    matches, best_score = matching_service._scan_short_windows_with_concordance(
+        reference_features,
+        search_indexes=indexes,
+        scene_boundaries=(),
+    )
+
+    assert len(matches) == 1
+    assert matches[0].source_start_seconds == pytest.approx(20)
+    assert matches[0].duration_seconds == pytest.approx(8)
+    assert best_score == pytest.approx(0.75)
+
+
 def test_concordance_tree_joins_one_second_scenes_into_a_coherent_match() -> None:
     import numpy as np
 

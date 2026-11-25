@@ -381,7 +381,7 @@ class AudioMatchingService:
     fine_segment_seconds = 4
     concordance_window_seconds = 2
     concordance_step_seconds = 0.5
-    concordance_top_candidates = 3
+    concordance_top_candidates = 8
     concordance_minimum_score = 0.48
     concordance_minimum_windows = 3
     concordance_position_tolerance_ratio = 0.2
@@ -1097,12 +1097,17 @@ class AudioMatchingService:
                         previous_match.reference_duration_seconds
                         or previous_match.duration_seconds,
                     )
+                    longer_duration = max(
+                        reference_duration,
+                        previous_match.reference_duration_seconds
+                        or previous_match.duration_seconds,
+                    )
                     source_separation = abs(
                         first.source_start_seconds - previous_match.source_start_seconds
                     )
                     if (
                         shorter_duration > 0
-                        and overlap / shorter_duration >= 0.5
+                        and overlap / max(longer_duration, 1e-12) >= 0.85
                         and source_separation > max(1.0, shorter_duration * 0.1)
                         and abs(average_score - previous_match.score) <= 0.05
                     ):
