@@ -567,6 +567,30 @@ def test_speech_band_detail_above_two_khz_improves_location_matching() -> None:
     )
 
 
+def test_tempo_search_finds_reference_sped_up_by_twenty_percent() -> None:
+    import numpy as np
+
+    matching_service = AudioMatchingService()
+    generator = np.random.default_rng(235)
+    source_features = generator.normal(size=(3_000, 48)).astype(np.float32)
+    source_features /= np.maximum(
+        np.linalg.norm(source_features, axis=1, keepdims=True),
+        1e-8,
+    )
+    expected_source_frame = 550
+    source_segment = source_features[expected_source_frame : expected_source_frame + 1_800]
+    reference_features = matching_service._resample_features(source_segment, 1 / 1.2)
+
+    source_frame, score, tempo_factor = matching_service._find_best_tempo_match(
+        source_features,
+        reference_features,
+    )
+
+    assert source_frame == expected_source_frame
+    assert tempo_factor == pytest.approx(1.2)
+    assert score >= 0.8
+
+
 def test_fingerprint_does_not_inflate_unrelated_audio_confidence() -> None:
     import numpy as np
 
@@ -775,6 +799,106 @@ def test_dtw_refines_locally_variable_speed() -> None:
     assert abs(refined.source_start_seconds - 10) <= 0.1
     assert abs(refined.duration_seconds - 9) <= 0.2
     assert refined.score >= initial_match.score
+
+
+def test_contiguous_match_keeps_full_duration_after_open_ended_dtw(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import numpy as np
+
+    matching_service = AudioMatchingService()
+    analysis = AudioAnalysis(
+        source_samples=np.zeros(matching_service.analysis_sample_rate * 12, dtype=np.float32),
+        reference_samples=np.zeros(matching_service.analysis_sample_rate * 5, dtype=np.float32),
+        source_features=np.zeros((600, 32), dtype=np.float32),
+        reference_features=np.zeros((250, 32), dtype=np.float32),
+    )
+    monkeypatch.setattr(
+        matching_service,
+        "_find_best_tempo_match_with_pitch",
+        lambda *_args, **_kwargs: (50, 0.95, 1.0, 0),
+    )
+
+    def trim_with_open_ended_dtw(
+        match: AudioSegmentMatch,
+        *_args: object,
+        **_kwargs: object,
+    ) -> AudioSegmentMatch:
+        return AudioSegmentMatch(
+            source_start_seconds=match.source_start_seconds + 0.04,
+            reference_start_seconds=match.reference_start_seconds,
+            duration_seconds=match.duration_seconds - 0.4,
+            score=0.97,
+            reference_duration_seconds=match.reference_duration_seconds,
+            tempo_factor=0.92,
+        )
+
+    monkeypatch.setattr(
+        matching_service,
+        "_refine_match_with_dtw",
+        trim_with_open_ended_dtw,
+    )
+    monkeypatch.setattr(
+        matching_service,
+        "_refine_segment_match",
+        lambda match, *_args, **_kwargs: match,
+    )
+
+    refined = matching_service._find_contiguous_match(analysis)
+
+    assert refined.source_start_seconds == pytest.approx(
+        50 / matching_service.feature_rate + 0.04
+    )
+    assert refined.duration_seconds == pytest.approx(5.0)
+    assert refined.tempo_factor == pytest.approx(1.0)
+
+
+def test_dense_edit_profile_expands_speed_range_without_extra_matching_pass(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import numpy as np
+    from types import SimpleNamespace
+
+    matching_service = AudioMatchingService(SimpleNamespace())
+    analysis = AudioAnalysis(
+        source_samples=np.zeros(8_000 * 90, dtype=np.float32),
+        reference_samples=np.zeros(8_000 * 60, dtype=np.float32),
+        source_features=np.zeros((4_500, 32), dtype=np.float32),
+        reference_features=np.zeros((3_000, 32), dtype=np.float32),
+        reference_scene_boundaries=tuple(float(index * 2) for index in range(1, 16)),
+        reference_media_duration_seconds=60.0,
+    )
+    scene_calls: list[float] = []
+
+    def detect_scenes(_path: str, *, threshold: float = 0.3) -> tuple[float, ...]:
+        scene_calls.append(threshold)
+        return (2.0, 4.0, 6.0)
+
+    monkeypatch.setattr(
+        AudioMatchingService,
+        "_load_analysis",
+        lambda _self, _source, _reference: analysis,
+    )
+    monkeypatch.setattr(
+        matching_service.media_service,
+        "detect_scene_boundaries",
+        detect_scenes,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        AudioMatchingService,
+        "_find_matches_from_analysis",
+        lambda self, selected_analysis: (
+            self.tempo_factors,
+            selected_analysis.reference_scene_boundaries,
+        ),
+    )
+
+    tempo_factors, boundaries = matching_service.find_matches("source", "reference")
+
+    assert tempo_factors == (1.0, 1.1, 1.2, 1.5)
+    assert boundaries == (2.0, 4.0, 6.0)
+    assert scene_calls == [0.5]
 
 
 def test_real_reencoded_and_accelerated_audio_is_located_at_correct_time(
@@ -1536,8 +1660,14 @@ def test_pitch_shifted_montage_refinement_preserves_each_source_segment(
         abs=0.1,
     )
     assert all(
-        match.alignment_confirmation_score is not None
-        and match.alignment_confirmation_score >= 0.55
+        (
+            match.alignment_confirmation_score is not None
+            and match.alignment_confirmation_score >= 0.55
+        )
+        or (
+            match.pitch_shift_semitones != 0
+            and match.score >= matching_service.minimum_pitch_shift_spectral_score
+        )
         for match in matches
     )
 
@@ -1754,6 +1884,26 @@ def test_concordance_tree_rejects_accumulated_local_position_jumps() -> None:
     assert path == []
 
 
+def test_concordance_tree_keeps_path_at_float_rounded_scene_boundary() -> None:
+    matching_service = AudioMatchingService()
+    reference_starts = (7.34, 8.66, 10.0)
+    source_starts = (539.88, 541.22, 542.58)
+    durations = (1.32, 1.34, 2.0)
+    candidate_windows = [
+        [AudioSegmentMatch(source_start, reference_start, duration, 0.8, duration)]
+        for reference_start, source_start, duration in zip(
+            reference_starts, source_starts, durations, strict=True
+        )
+    ]
+
+    path = matching_service._best_concordant_window_path(
+        candidate_windows,
+        step_seconds=0.5,
+    )
+
+    assert len(path) == 3
+
+
 def test_sparse_landmark_votes_find_exact_offset_and_reject_unrelated_audio() -> None:
     import numpy as np
 
@@ -1839,7 +1989,7 @@ def test_scene_detection_uses_ffmpeg_cut_filter_and_parses_timestamps(
 
     assert boundaries == (2.5, 4.0)
     assert any("fps=12" in argument for argument in captured_command)
-    assert any("select='gt(scene,0.3)'" in argument for argument in captured_command)
+    assert any("select='gt(scene,0.2)'" in argument for argument in captured_command)
 
 
 def test_waveform_refinement_finds_precise_offset() -> None:

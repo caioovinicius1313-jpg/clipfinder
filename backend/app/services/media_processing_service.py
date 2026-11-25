@@ -58,6 +58,7 @@ class AudioAnalysis:
     reference_features: np.ndarray
     source_search_indexes: tuple[FeatureSearchIndex, FeatureSearchIndex] | None = None
     reference_scene_boundaries: tuple[float, ...] = ()
+    reference_media_duration_seconds: float | None = None
 
 
 @dataclass(frozen=True)
@@ -101,7 +102,15 @@ class MediaProcessingService:
     def probe_duration(self, file_path: str | Path) -> float | None:
         return self.probe(file_path).duration_seconds
 
-    def detect_scene_boundaries(self, file_path: str | Path) -> tuple[float, ...]:
+    def detect_scene_boundaries(
+        self,
+        file_path: str | Path,
+        *,
+        threshold: float = 0.2,
+    ) -> tuple[float, ...]:
+        threshold = float(threshold)
+        if not 0.0 <= threshold <= 1.0:
+            raise ValueError("O limiar de detecção de cena deve estar entre 0 e 1.")
         command = [
             self.get_ffmpeg_executable(),
             "-hide_banner",
@@ -111,7 +120,7 @@ class MediaProcessingService:
             "-i",
             str(file_path),
             "-vf",
-            "fps=12,scale=320:-2,select='gt(scene,0.3)',showinfo",
+            f"fps=12,scale=320:-2,select='gt(scene,{threshold})',showinfo",
             "-an",
             "-f",
             "null",
@@ -386,12 +395,14 @@ class AudioMatchingService:
     concordance_minimum_windows = 3
     concordance_position_tolerance_ratio = 0.2
     concordance_position_tolerance_floor_seconds = 0.08
+    concordance_boundary_tolerance_seconds = 1e-6
     pitch_shift_retry_threshold = 0.78
     pitch_shift_retry_semitones = (-2, -1, 1, 2)
     pitch_shift_extended_retry_semitones = (-4, -3, 3, 4)
     pitch_shift_extended_retry_floor = 0.45
     pitch_shift_tempo_radius = 0.05
     minimum_pitch_alignment_confirmation_score = 0.55
+    minimum_pitch_shift_spectral_score = 0.85
     segmented_comparison_score_threshold = 0.85
     spectral_evidence_weight = 0.75
     minimum_segment_seconds = 3
@@ -401,6 +412,9 @@ class AudioMatchingService:
     refinement_search_seconds = 3
     minimum_refinement_score = 0.15
     minimum_reference_coverage = 0.6
+    dense_edit_minimum_cuts_per_minute = 15.0
+    dense_edit_tempo_factors = (1.0, 1.1, 1.2, 1.5)
+    dense_edit_scene_threshold = 0.5
     dtw_search_padding_seconds = 1
     dtw_step_penalty = 0.05
     dtw_tempo_tolerance = 0.03
@@ -422,6 +436,8 @@ class AudioMatchingService:
         1.1,
         1.125,
         1.15,
+        1.175,
+        1.2,
     )
 
     def __init__(self, media_service: MediaProcessingService | None = None) -> None:
@@ -444,6 +460,40 @@ class AudioMatchingService:
         self, source_path: str | Path, reference_path: str | Path
     ) -> list[AudioSegmentMatch]:
         analysis = self._load_analysis(source_path, reference_path)
+        matcher = self
+        if self._is_high_edit_density(analysis):
+            detect_scenes = getattr(self.media_service, "detect_scene_boundaries", None)
+            if callable(detect_scenes):
+                analysis = replace(
+                    analysis,
+                    reference_scene_boundaries=tuple(
+                        detect_scenes(
+                            reference_path,
+                            threshold=self.dense_edit_scene_threshold,
+                        )
+                    ),
+                )
+            # The denser-edit profile uses a narrower, measured tempo grid to
+            # control processing cost. Hashtag-derived real samples do not
+            # establish a single speed factor for the user's exact reference.
+            matcher = AudioMatchingService(self.media_service)
+            matcher.tempo_factors = self.dense_edit_tempo_factors
+        return matcher._find_matches_from_analysis(analysis)
+
+    def _is_high_edit_density(self, analysis: AudioAnalysis) -> bool:
+        # Require a real probe duration for the adaptive profile; feature arrays
+        # in tests and custom integrations may be padded or downsampled.
+        duration = analysis.reference_media_duration_seconds
+        if duration is None:
+            return False
+        if duration <= 0:
+            return False
+        cuts_per_minute = len(analysis.reference_scene_boundaries) * 60.0 / duration
+        return cuts_per_minute >= self.dense_edit_minimum_cuts_per_minute
+
+    def _find_matches_from_analysis(
+        self, analysis: AudioAnalysis
+    ) -> list[AudioSegmentMatch]:
         try:
             contiguous_match = self._find_contiguous_match(analysis)
         except AudioMatchNotFoundError:
@@ -489,6 +539,10 @@ class AudioMatchingService:
         scene_boundaries = (
             tuple(detect_scenes(reference_path)) if callable(detect_scenes) else ()
         )
+        probe_duration = getattr(self.media_service, "probe_duration", None)
+        reference_media_duration = (
+            probe_duration(reference_path) if callable(probe_duration) else None
+        )
         return AudioAnalysis(
             source_samples=source_samples,
             reference_samples=reference_samples,
@@ -496,6 +550,7 @@ class AudioMatchingService:
             reference_features=reference_features,
             source_search_indexes=self._build_feature_search_indexes(source_features),
             reference_scene_boundaries=scene_boundaries,
+            reference_media_duration_seconds=reference_media_duration,
         )
 
     def _find_contiguous_match(self, analysis: AudioAnalysis) -> AudioSegmentMatch:
@@ -527,6 +582,15 @@ class AudioMatchingService:
             analysis.source_features,
             analysis.reference_features,
         )
+        # Subsequence DTW is open-ended and may shave a few frames from a
+        # continuous full-reference match. The tempo scan already spans the
+        # complete query, so use DTW for its refined start/score but retain the
+        # scan's full duration and tempo estimate.
+        dtw_match = replace(
+            dtw_match,
+            duration_seconds=match.duration_seconds,
+            tempo_factor=match.tempo_factor,
+        )
         return self._refine_segment_match(
             dtw_match,
             analysis.source_samples,
@@ -542,16 +606,31 @@ class AudioMatchingService:
             analysis.reference_features,
             search_indexes=analysis.source_search_indexes,
             reference_scene_boundaries=analysis.reference_scene_boundaries,
+            reference_media_duration_seconds=analysis.reference_media_duration_seconds,
         )
 
-        dtw_matches = [
-            self._refine_match_with_dtw(
+        dtw_matches: list[AudioSegmentMatch] = []
+        for match in matches:
+            refined = self._refine_match_with_dtw(
                 match,
                 analysis.source_features,
                 analysis.reference_features,
             )
-            for match in matches
-        ]
+            if self._match_is_scene_anchored(
+                match,
+                analysis.reference_scene_boundaries,
+                analysis.reference_media_duration_seconds,
+            ):
+                # DTW can shave a few analysis frames from a clip whose visual
+                # edit points are already known. Keep the scene-bounded duration;
+                # the sample-level pass below still refines its source start.
+                refined = replace(
+                    refined,
+                    duration_seconds=match.duration_seconds,
+                    tempo_factor=match.tempo_factor,
+                    reference_duration_seconds=match.reference_duration_seconds,
+                )
+            dtw_matches.append(refined)
         refined_matches = [
             self._refine_segment_match(
                 match,
@@ -589,6 +668,7 @@ class AudioMatchingService:
         *,
         search_indexes: tuple[FeatureSearchIndex, FeatureSearchIndex] | None = None,
         reference_scene_boundaries: tuple[float, ...] = (),
+        reference_media_duration_seconds: float | None = None,
     ) -> list[AudioSegmentMatch]:
         if reference_features.shape[0] >= source_features.shape[0]:
             raise MediaProcessingError("O vídeo de referência precisa ser menor que o vídeo original.")
@@ -676,6 +756,13 @@ class AudioMatchingService:
             source_features,
             reference_features,
         )
+        selected_matches = self._snap_discontinuous_matches_to_scene_boundaries(
+            selected_matches,
+            reference_scene_boundaries=reference_scene_boundaries,
+            reference_duration_seconds=(
+                reference_media_duration_seconds or reference_duration
+            ),
+        )
         best_score = max((scan[1] for scan in selection_scans), default=0.0)
         self._validate_reference_coverage(
             selected_matches,
@@ -683,6 +770,110 @@ class AudioMatchingService:
             best_score=best_score,
         )
         return selected_matches
+
+    def _snap_discontinuous_matches_to_scene_boundaries(
+        self,
+        matches: list[AudioSegmentMatch],
+        *,
+        reference_scene_boundaries: tuple[float, ...],
+        reference_duration_seconds: float,
+    ) -> list[AudioSegmentMatch]:
+        """Use a nearby visual cut to correct an audio-estimated montage edit."""
+        if len(matches) < 2 or not reference_scene_boundaries:
+            return matches
+
+        ordered = sorted(matches, key=lambda match: match.reference_start_seconds)
+        saw_discontinuous_edit = False
+        for index in range(1, len(ordered)):
+            previous = ordered[index - 1]
+            current = ordered[index]
+            previous_duration = (
+                previous.reference_duration_seconds or previous.duration_seconds
+            )
+            current_duration = (
+                current.reference_duration_seconds or current.duration_seconds
+            )
+            previous_offset = previous.source_start_seconds - (
+                previous.reference_start_seconds * previous.tempo_factor
+            )
+            current_offset = current.source_start_seconds - (
+                current.reference_start_seconds * current.tempo_factor
+            )
+            if abs(current_offset - previous_offset) <= max(
+                0.5, min(previous_duration, current_duration) * 0.08
+            ):
+                continue
+
+            saw_discontinuous_edit = True
+            expected_boundary = (
+                previous.reference_start_seconds
+                + previous_duration
+                + current.reference_start_seconds
+            ) / 2
+            scene_boundary = min(
+                reference_scene_boundaries,
+                key=lambda boundary: abs(boundary - expected_boundary),
+            )
+            # Scene detection runs on a low-resolution preview cadence; only snap
+            # when its timestamp is already close to the independently audio-
+            # located edit. This does not invent a boundary in uncertain regions.
+            if abs(scene_boundary - expected_boundary) > 0.12:
+                continue
+
+            previous_new_duration = (
+                scene_boundary - previous.reference_start_seconds
+            )
+            if previous_new_duration < self.minimum_segment_seconds:
+                continue
+            ordered[index - 1] = replace(
+                previous,
+                duration_seconds=previous_new_duration * previous.tempo_factor,
+                reference_duration_seconds=previous_new_duration,
+            )
+            ordered[index] = replace(
+                current,
+                reference_start_seconds=scene_boundary,
+            )
+
+        if not saw_discontinuous_edit:
+            return ordered
+
+        last = ordered[-1]
+        last_duration = last.reference_duration_seconds or last.duration_seconds
+        reference_end = last.reference_start_seconds + last_duration
+        if abs(reference_end - reference_duration_seconds) <= 0.12:
+            final_duration = reference_duration_seconds - last.reference_start_seconds
+            if final_duration >= self.minimum_segment_seconds:
+                ordered[-1] = replace(
+                    last,
+                    duration_seconds=final_duration * last.tempo_factor,
+                    reference_duration_seconds=final_duration,
+                )
+        return ordered
+
+    def _match_is_scene_anchored(
+        self,
+        match: AudioSegmentMatch,
+        scene_boundaries: tuple[float, ...],
+        reference_duration_seconds: float | None,
+    ) -> bool:
+        if not scene_boundaries or reference_duration_seconds is None:
+            return False
+        reference_start = match.reference_start_seconds
+        reference_duration = match.reference_duration_seconds or match.duration_seconds
+        reference_end = reference_start + reference_duration
+        start_is_anchored = reference_start <= 0.12 or any(
+            abs(reference_start - boundary) <= 1e-6
+            for boundary in scene_boundaries
+        )
+        end_is_anchored = (
+            abs(reference_end - reference_duration_seconds) <= 1e-6
+            or any(
+                abs(reference_end - boundary) <= 1e-6
+                for boundary in scene_boundaries
+            )
+        )
+        return start_is_anchored and end_is_anchored
 
     def _refine_discontinuous_boundaries(
         self,
@@ -1281,6 +1472,7 @@ class AudioMatchingService:
                 step_seconds * 1.5,
                 prior.reference_duration_seconds or prior.duration_seconds,
             )
+            + self.concordance_boundary_tolerance_seconds
             for prior, current in zip(path, path[1:])
         ):
             return []
@@ -2131,6 +2323,9 @@ class AudioMatchingService:
             if require_score and landmark_alignment is None:
                 if (
                     match.pitch_shift_semitones
+                    and match.score >= self.minimum_pitch_shift_spectral_score
+                ) or (
+                    match.pitch_shift_semitones
                     and match.alignment_confirmation_score is not None
                     and match.alignment_confirmation_score
                     >= self.minimum_pitch_alignment_confirmation_score
@@ -2144,9 +2339,30 @@ class AudioMatchingService:
                 return match
 
         waveform_start = (search_start + relative_start) / sample_rate
+        if (
+            match.alignment_confirmation_score is not None
+            and match.alignment_confirmation_score
+            >= 0.8
+            and abs(waveform_start - match.source_start_seconds) > 0.18
+        ):
+            # A pitch-shifted waveform can correlate strongly with a different
+            # repetition in the search window. Do not let that ambiguous local
+            # peak override a strong DTW alignment; repeated background can also
+            # make audio landmarks agree on the same wrong alternate occurrence.
+            return match
         if landmark_alignment is not None:
             landmark_offset, inlier_count, _ = landmark_alignment
             landmark_start = search_start / sample_rate + landmark_offset
+            if (
+                match.alignment_confirmation_score is not None
+                and match.alignment_confirmation_score >= 0.8
+                and abs(landmark_start - match.source_start_seconds) > 0.18
+            ):
+                # A strong feature alignment already fixes the segment's time.
+                # Landmark voting can lock onto repeated background/music and
+                # move the cut to a different occurrence; disagreement is not
+                # evidence to replace the better-supported timestamp.
+                return match
             waveform_disagrees = abs(waveform_start - landmark_start) > 0.18
             if refinement_score < self.minimum_refinement_score or (
                 waveform_disagrees and inlier_count >= 12
