@@ -816,13 +816,13 @@ class AudioMatchingService:
             ]
             logger.warning(
                 "Audio match rejected: source_duration=%.2fs reference_duration=%.2fs "
-                "source_samples=%d reference_samples=%d scene_boundaries=%s "
+                "source_feature_frames=%d reference_feature_frames=%d scene_boundaries=%s "
                 "required_coverage=%.3f selected_coverage=%.3f "
                 "selected_average_score=%.3f best_score=%.3f candidates=%s",
-                analysis.source_samples.size / self.analysis_sample_rate,
-                reference_duration,
-                analysis.source_samples.size,
-                analysis.reference_samples.size,
+                source_features.shape[0] / self.feature_rate,
+                reference_features.shape[0] / self.feature_rate,
+                source_features.shape[0],
+                reference_features.shape[0],
                 [round(boundary, 2) for boundary in reference_scene_boundaries],
                 required_duration / max(reference_duration, 1e-12),
                 covered_duration / max(reference_duration, 1e-12),
