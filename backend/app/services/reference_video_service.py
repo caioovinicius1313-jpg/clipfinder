@@ -156,6 +156,7 @@ class ReferenceVideoService:
         *,
         reference_video: ReferenceVideo,
         downloaded_path: Path,
+        download_format_version: int | None = None,
     ) -> ReferenceVideo:
         extension = downloaded_path.suffix.lower() or ".mp4"
         filename = f"youtube-{reference_video.external_id or reference_video.id}{extension}"
@@ -186,4 +187,5 @@ class ReferenceVideoService:
             path=stored_path,
             size=size,
             duration=duration,
+            download_format_version=download_format_version,
         )

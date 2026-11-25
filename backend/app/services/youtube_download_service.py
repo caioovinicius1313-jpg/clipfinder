@@ -20,6 +20,9 @@ class YoutubeDownloadService:
     # return no formats for a perfectly public watch-page URL. Keep extraction
     # on yt-dlp's default client set instead.
     extractor_args = "youtube:player_client=default"
+    # Increment when the audio/video selection strategy changes. Stored YouTube
+    # references with an older or missing version are refreshed before matching.
+    reference_download_format_version = 2
     video_id_pattern = re.compile(r"^[A-Za-z0-9_-]{6,100}$")
 
     def extract_video_id(self, value: str) -> str:
@@ -149,13 +152,18 @@ class YoutubeDownloadService:
             "--no-warnings",
             "--format",
             (
-                "worst[height<=480]/worst"
+                "worstvideo[height<=480]+bestaudio/"
+                "best[height<=480][vcodec!=none]/best[height<=480][vcodec!=none]"
                 if reference_quality
                 else "bestvideo*+bestaudio/best"
             ),
             "--merge-output-format",
             "mp4",
         ]
+        if reference_quality:
+            # Prefer the video's original audio language. Without this, yt-dlp
+            # may select a dubbed track that does not match the source video.
+            command.extend(["--format-sort-force", "--format-sort", "lang,quality"])
         if use_configured_clients:
             command.extend(["--extractor-args", self.extractor_args])
         command.extend(

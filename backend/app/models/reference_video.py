@@ -30,6 +30,7 @@ class ReferenceVideo(Base):
     thumbnail_url: Mapped[str | None] = mapped_column(String(1024), nullable=True)
     channel_title: Mapped[str | None] = mapped_column(String(255), nullable=True)
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    download_format_version: Mapped[int | None] = mapped_column(nullable=True)
     status: Mapped[str] = mapped_column(String(50), nullable=False, default="uploaded")
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False

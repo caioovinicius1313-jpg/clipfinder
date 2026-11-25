@@ -284,7 +284,16 @@ class AutomationService:
             )
             if reference is None:
                 raise AutomationSelectionError("Uma referência selecionada foi excluída.")
-            if reference.path and self._stored_file_exists(reference.path):
+            format_version = getattr(self.downloader, "reference_download_format_version", 1)
+            reference_needs_refresh = (
+                reference.source == "youtube"
+                and reference.download_format_version != format_version
+            )
+            if (
+                reference.path
+                and not reference_needs_refresh
+                and self._stored_file_exists(reference.path)
+            ):
                 prepared.append(reference.id)
             else:
                 self.reference_repository.set_status(database, reference, "downloading")
@@ -298,6 +307,9 @@ class AutomationService:
                     database,
                     reference_video=reference,
                     downloaded_path=downloaded_path,
+                    download_format_version=(
+                        format_version if reference.source == "youtube" else None
+                    ),
                 )
                 prepared.append(reference.id)
             self.run_repository.update(

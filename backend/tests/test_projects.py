@@ -5,6 +5,7 @@ import uuid
 from collections.abc import Generator
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from fastapi.testclient import TestClient
@@ -114,6 +115,98 @@ def test_youtube_download_retries_with_default_clients_when_formats_are_unavaila
     assert len(calls) == 2
     assert "--extractor-args" in calls[0]
     assert "--extractor-args" not in calls[1]
+
+
+def test_reference_download_prefers_video_original_language(tmp_path: Path) -> None:
+    output_template = tmp_path / "reference.%(ext)s"
+    command = YoutubeDownloadService()._build_download_command(
+        "abc123_DEF",
+        tmp_path,
+        output_template=output_template,
+        reference_quality=True,
+        use_configured_clients=True,
+    )
+
+    format_selector = command[command.index("--format") + 1]
+    assert format_selector.startswith("worstvideo[height<=480]+bestaudio/")
+    assert "--format-sort-force" in command
+    assert command[command.index("--format-sort") + 1] == "lang,quality"
+
+
+def test_source_download_keeps_high_quality_selection(tmp_path: Path) -> None:
+    command = YoutubeDownloadService()._build_download_command(
+        "abc123_DEF",
+        tmp_path,
+        output_template=tmp_path / "source.%(ext)s",
+        reference_quality=False,
+        use_configured_clients=True,
+    )
+
+    assert command[command.index("--format") + 1] == "bestvideo*+bestaudio/best"
+    assert "--format-sort-force" not in command
+
+
+def test_automation_refreshes_old_youtube_reference_downloads(
+    tmp_path: Path,
+) -> None:
+    reference_id = uuid.uuid4()
+    project_id = uuid.uuid4()
+    reference = SimpleNamespace(
+        id=reference_id,
+        project_id=project_id,
+        source="youtube",
+        external_id="abc123_DEF",
+        path="bucket://old-reference.mp4",
+        download_format_version=None,
+    )
+    downloaded_path = tmp_path / "new-reference.mp4"
+    downloaded_path.write_bytes(b"updated")
+    download_calls: list[tuple[object, ...]] = []
+    import_calls: list[dict[str, object]] = []
+
+    class FakeReferenceRepository:
+        def get_by_id(self, *_args: object) -> SimpleNamespace:
+            return reference
+
+        def set_status(self, *_args: object) -> SimpleNamespace:
+            return reference
+
+    class FakeDownloader:
+        reference_download_format_version = 2
+
+        def download_video(self, *args: object, **kwargs: object) -> Path:
+            download_calls.append((args, kwargs))
+            return downloaded_path
+
+    class FakeReferenceService:
+        def import_downloaded(self, *_args: object, **kwargs: object) -> SimpleNamespace:
+            import_calls.append(kwargs)
+            reference.download_format_version = kwargs["download_format_version"]
+            return reference
+
+    class FakeRunRepository:
+        def update(self, *_args: object, **_kwargs: object) -> None:
+            return None
+
+    service = AutomationService.__new__(AutomationService)
+    service.reference_repository = FakeReferenceRepository()
+    service.downloader = FakeDownloader()
+    service.reference_service = FakeReferenceService()
+    service.run_repository = FakeRunRepository()
+    service._stored_file_exists = lambda _path: True
+
+    prepared = service._prepare_references(
+        database=None,  # type: ignore[arg-type]
+        run=object(),
+        project_id=project_id,
+        reference_video_ids=[reference_id],
+        temporary_directory=tmp_path,
+    )
+
+    assert prepared == [reference_id]
+    assert len(download_calls) == 1
+    assert import_calls[0]["download_format_version"] == 2
+    assert reference.download_format_version == 2
 
 
 def test_automation_search_and_selection_routes(

@@ -120,11 +120,13 @@ class ReferenceVideoRepository:
         path: str,
         size: int,
         duration: float | None,
+        download_format_version: int | None = None,
     ) -> ReferenceVideo:
         reference_video.filename = filename
         reference_video.path = path
         reference_video.size = size
         reference_video.duration = duration
+        reference_video.download_format_version = download_format_version
         reference_video.status = "uploaded"
         database.add(reference_video)
         database.commit()
