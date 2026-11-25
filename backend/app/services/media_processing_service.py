@@ -3,7 +3,6 @@ import re
 import shutil
 import subprocess
 import tempfile
-from bisect import bisect_right
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -33,6 +32,8 @@ class AudioSegmentMatch:
     score: float
     reference_duration_seconds: float | None = None
     tempo_factor: float = 1.0
+    pitch_shift_semitones: int = 0
+    alignment_confirmation_score: float | None = None
 
 
 @dataclass
@@ -49,6 +50,7 @@ class AudioAnalysis:
     source_features: np.ndarray
     reference_features: np.ndarray
     source_search_indexes: tuple[FeatureSearchIndex, FeatureSearchIndex] | None = None
+    reference_scene_boundaries: tuple[float, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -92,6 +94,47 @@ class MediaProcessingService:
     def probe_duration(self, file_path: str | Path) -> float | None:
         return self.probe(file_path).duration_seconds
 
+    def detect_scene_boundaries(self, file_path: str | Path) -> tuple[float, ...]:
+        command = [
+            self.get_ffmpeg_executable(),
+            "-hide_banner",
+            "-loglevel",
+            "info",
+            "-nostdin",
+            "-i",
+            str(file_path),
+            "-vf",
+            "fps=12,scale=320:-2,select='gt(scene,0.3)',showinfo",
+            "-an",
+            "-f",
+            "null",
+            "-",
+        ]
+        try:
+            result = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                check=False,
+                timeout=settings.yt_dlp_timeout_seconds,
+            )
+        except (OSError, subprocess.TimeoutExpired) as error:
+            logger.warning("Não foi possível detectar emendas visuais: %s", error)
+            return ()
+
+        if result.returncode != 0:
+            logger.warning("Detecção de emendas visuais falhou: %s", result.stderr[-600:])
+            return ()
+
+        boundaries: list[float] = []
+        for match in re.finditer(r"pts_time:\s*(-?\d+(?:\.\d+)?)", result.stderr):
+            timestamp = float(match.group(1))
+            if timestamp > 0 and (not boundaries or timestamp - boundaries[-1] >= 1.0):
+                boundaries.append(timestamp)
+        return tuple(boundaries)
+
     def extract_audio_samples(self, file_path: str | Path, *, sample_rate: int) -> np.ndarray:
         command = [
             self.get_ffmpeg_executable(),
@@ -102,6 +145,11 @@ class MediaProcessingService:
             "-map",
             "0:a:0",
             "-vn",
+            # Keep audio timestamps on the video's zero-based timeline. Without
+            # this, FFmpeg rebases the first audio packet to t=0 and matching
+            # results drift whenever the audio stream starts after the video.
+            "-af",
+            "aresample=first_pts=0",
             "-ac",
             "1",
             "-ar",
@@ -319,23 +367,40 @@ class MediaProcessingService:
 
 class AudioMatchingService:
     minimum_score = 0.45
+    contiguous_minimum_score = 0.60
     minimum_segment_score = 0.30
+    minimum_average_match_score = 0.60
     segment_seconds = 8
     fine_segment_seconds = 4
+    concordance_window_seconds = 2
+    concordance_step_seconds = 0.5
+    concordance_top_candidates = 3
+    concordance_minimum_score = 0.48
+    concordance_minimum_windows = 3
+    concordance_position_tolerance_ratio = 0.2
+    concordance_position_tolerance_floor_seconds = 0.08
+    pitch_shift_retry_threshold = 0.78
+    pitch_shift_retry_semitones = (-2, -1, 1, 2)
+    pitch_shift_extended_retry_semitones = (-4, -3, 3, 4)
+    pitch_shift_extended_retry_floor = 0.45
+    pitch_shift_tempo_radius = 0.05
+    minimum_pitch_alignment_confirmation_score = 0.55
+    segmented_comparison_score_threshold = 0.85
+    spectral_evidence_weight = 0.75
     minimum_segment_seconds = 3
-    analysis_sample_rate = 4_000
-    feature_rate = 20
+    analysis_sample_rate = 8_000
+    feature_rate = 50
     refinement_sample_rate = analysis_sample_rate
     refinement_search_seconds = 3
     minimum_refinement_score = 0.15
     minimum_reference_coverage = 0.6
-    dtw_search_padding_seconds = 3
+    dtw_search_padding_seconds = 1
     dtw_step_penalty = 0.05
     dtw_tempo_tolerance = 0.03
     analysis_window_seconds = 0.1
-    mel_band_count = 16
+    mel_band_count = 24
     minimum_analysis_frequency = 80
-    maximum_analysis_frequency = 1_900
+    maximum_analysis_frequency = 3_800
     tempo_factors = (
         0.85,
         0.875,
@@ -373,9 +438,34 @@ class AudioMatchingService:
     ) -> list[AudioSegmentMatch]:
         analysis = self._load_analysis(source_path, reference_path)
         try:
-            return [self._find_contiguous_match(analysis)]
+            contiguous_match = self._find_contiguous_match(analysis)
         except AudioMatchNotFoundError:
             return self._find_segmented_matches_from_analysis(analysis)
+
+        try:
+            segmented_matches = self._find_segmented_matches_from_analysis(analysis)
+        except AudioMatchNotFoundError:
+            return [contiguous_match]
+
+        segmented_score = self._weighted_average_match_score(segmented_matches)
+        has_discontinuous_alignment = any(
+            abs(
+                match.source_start_seconds
+                - (
+                    contiguous_match.source_start_seconds
+                    + match.reference_start_seconds * contiguous_match.tempo_factor
+                )
+            )
+            > max(0.5, (match.reference_duration_seconds or match.duration_seconds) * 0.08)
+            for match in segmented_matches
+        )
+        if (
+            len(segmented_matches) > 1
+            and has_discontinuous_alignment
+            and segmented_score >= contiguous_match.score - 0.05
+        ):
+            return segmented_matches
+        return [contiguous_match]
 
     def _load_analysis(
         self, source_path: str | Path, reference_path: str | Path
@@ -388,21 +478,28 @@ class AudioMatchingService:
         )
         source_features = self._spectral_features_from_samples(source_samples)
         reference_features = self._spectral_features_from_samples(reference_samples)
+        detect_scenes = getattr(self.media_service, "detect_scene_boundaries", None)
+        scene_boundaries = (
+            tuple(detect_scenes(reference_path)) if callable(detect_scenes) else ()
+        )
         return AudioAnalysis(
             source_samples=source_samples,
             reference_samples=reference_samples,
             source_features=source_features,
             reference_features=reference_features,
             source_search_indexes=self._build_feature_search_indexes(source_features),
+            reference_scene_boundaries=scene_boundaries,
         )
 
     def _find_contiguous_match(self, analysis: AudioAnalysis) -> AudioSegmentMatch:
-        start_frame, score, tempo_factor = self._find_best_tempo_match(
-            analysis.source_features,
-            analysis.reference_features,
-            search_indexes=analysis.source_search_indexes,
+        start_frame, score, tempo_factor, pitch_shift_semitones = (
+            self._find_best_tempo_match_with_pitch(
+                analysis.source_features,
+                analysis.reference_features,
+                search_indexes=analysis.source_search_indexes,
+            )
         )
-        if score < self.minimum_score:
+        if score < self.contiguous_minimum_score:
             raise AudioMatchNotFoundError(
                 "Nenhum trecho com assinatura de áudio suficientemente parecida foi encontrado "
                 f"(melhor confiança {score:.0%})."
@@ -416,6 +513,7 @@ class AudioMatchingService:
             score=score,
             reference_duration_seconds=reference_duration_seconds,
             tempo_factor=tempo_factor,
+            pitch_shift_semitones=pitch_shift_semitones,
         )
         dtw_match = self._refine_match_with_dtw(
             match,
@@ -426,6 +524,7 @@ class AudioMatchingService:
             dtw_match,
             analysis.source_samples,
             analysis.reference_samples,
+            require_score=True,
         )
 
     def _find_segmented_matches_from_analysis(
@@ -435,6 +534,7 @@ class AudioMatchingService:
             analysis.source_features,
             analysis.reference_features,
             search_indexes=analysis.source_search_indexes,
+            reference_scene_boundaries=analysis.reference_scene_boundaries,
         )
 
         dtw_matches = [
@@ -450,6 +550,7 @@ class AudioMatchingService:
                 match,
                 analysis.source_samples,
                 analysis.reference_samples,
+                require_score=True,
             )
             for match in dtw_matches
         ]
@@ -480,6 +581,7 @@ class AudioMatchingService:
         reference_features: np.ndarray,
         *,
         search_indexes: tuple[FeatureSearchIndex, FeatureSearchIndex] | None = None,
+        reference_scene_boundaries: tuple[float, ...] = (),
     ) -> list[AudioSegmentMatch]:
         if reference_features.shape[0] >= source_features.shape[0]:
             raise MediaProcessingError("O vídeo de referência precisa ser menor que o vídeo original.")
@@ -494,9 +596,9 @@ class AudioMatchingService:
             ),
         )
 
-        # Keep the fast, high-context pass first. If its rigid 8-second borders
-        # cross edits in a montage, retry with two offset 4-second grids. Each
-        # grid is non-overlapping, so accepted coverage cannot be double-counted.
+        # Use longer windows as anchors. If the high-context grids are incomplete,
+        # a short-window concordance pass can branch over the best candidates and
+        # retain only a temporally consistent path.
         scans = [
             self._scan_reference_segments(
                 source_features,
@@ -504,9 +606,12 @@ class AudioMatchingService:
                 segment_seconds=self.segment_seconds,
                 offset_seconds=0,
                 search_indexes=indexes,
+                reference_scene_boundaries=reference_scene_boundaries,
             )
         ]
-        if self._matched_reference_duration(scans[0][0]) < required_coverage:
+        coarse_coverage = self._matched_reference_duration(scans[0][0])
+        coarse_average = self._weighted_average_match_score(scans[0][0])
+        if coarse_coverage < required_coverage or coarse_average < 0.72:
             for offset_seconds in (0, self.fine_segment_seconds / 2):
                 scans.append(
                     self._scan_reference_segments(
@@ -515,22 +620,586 @@ class AudioMatchingService:
                         segment_seconds=self.fine_segment_seconds,
                         offset_seconds=offset_seconds,
                         search_indexes=indexes,
+                        reference_scene_boundaries=reference_scene_boundaries,
                     )
                 )
 
-        selected_matches, best_score = max(
-            scans,
-            key=lambda scan: (
-                self._matched_reference_duration(scan[0]),
-                sum(match.score for match in scan[0]),
-            ),
+        def scan_quality(
+            scan: tuple[list[AudioSegmentMatch], float],
+        ) -> tuple[float, float, float]:
+            matched_duration = self._matched_reference_duration(scan[0])
+            coverage = min(matched_duration / reference_duration, 1.0)
+            average_score = self._weighted_average_match_score(scan[0])
+            # Rank by confidence across the whole query: a weaker extra segment
+            # should not beat a shorter, coherent match just by increasing coverage.
+            return average_score * coverage, average_score, coverage
+
+        coarse_matches, _ = max(scans, key=scan_quality)
+        candidate_scans = list(scans)
+
+        coarse_coverage = self._matched_reference_duration(coarse_matches)
+        has_coarse_discontinuity = self._has_discontinuous_match_alignment(coarse_matches)
+        if (
+            reference_scene_boundaries
+            or coarse_coverage < reference_duration * 0.9
+            or self._weighted_average_match_score(coarse_matches) < 0.8
+            or has_coarse_discontinuity
+        ):
+            concordant_matches, concordant_best_score = self._scan_short_windows_with_concordance(
+                reference_features,
+                search_indexes=indexes,
+                scene_boundaries=reference_scene_boundaries,
+            )
+            if concordant_matches:
+                candidate_scans.append((concordant_matches, concordant_best_score))
+
+        valid_scans = [
+            scan
+            for scan in candidate_scans
+            if self._matched_reference_duration(scan[0]) >= required_coverage
+            and self._weighted_average_match_score(scan[0])
+            >= self.minimum_average_match_score
+        ]
+        selection_scans = valid_scans or candidate_scans
+        selected_matches = self._select_non_overlapping_reference_matches(
+            [match for matches, _ in selection_scans for match in matches]
         )
+        selected_matches = self._refine_discontinuous_boundaries(
+            selected_matches,
+            source_features,
+            reference_features,
+        )
+        best_score = max((scan[1] for scan in selection_scans), default=0.0)
         self._validate_reference_coverage(
             selected_matches,
             reference_duration,
             best_score=best_score,
         )
         return selected_matches
+
+    def _refine_discontinuous_boundaries(
+        self,
+        matches: list[AudioSegmentMatch],
+        source_features: np.ndarray,
+        reference_features: np.ndarray,
+    ) -> list[AudioSegmentMatch]:
+        """Refine edit points by comparing both adjacent source alignments locally."""
+        if len(matches) < 2:
+            return matches
+
+        ordered = sorted(matches, key=lambda match: match.reference_start_seconds)
+        feature_rate = self.feature_rate
+        search_radius_frames = round(1.5 * feature_rate)
+        candidate_boundary_indexes: list[int] = []
+        for index in range(1, len(ordered)):
+            previous = ordered[index - 1]
+            current = ordered[index]
+            previous_duration = previous.reference_duration_seconds or previous.duration_seconds
+            current_duration = current.reference_duration_seconds or current.duration_seconds
+            previous_end = previous.reference_start_seconds + previous_duration
+            current_start = current.reference_start_seconds
+            previous_offset = previous.source_start_seconds - (
+                previous.reference_start_seconds * previous.tempo_factor
+            )
+            current_offset = current.source_start_seconds - (
+                current.reference_start_seconds * current.tempo_factor
+            )
+            if current_start - previous_end > 0.5:
+                continue
+            if abs(current_offset - previous_offset) <= max(
+                0.5,
+                min(previous_duration, current_duration) * 0.08,
+            ):
+                continue
+
+            expected_boundary = (previous_end + current_start) / 2
+            lower_boundary = max(
+                previous.reference_start_seconds + self.minimum_segment_seconds,
+                expected_boundary - search_radius_frames / feature_rate,
+            )
+            upper_boundary = min(
+                current_start + current_duration - self.minimum_segment_seconds,
+                expected_boundary + search_radius_frames / feature_rate,
+            )
+            if upper_boundary > lower_boundary:
+                candidate_boundary_indexes.append(index)
+
+        if not candidate_boundary_indexes:
+            return ordered
+
+        normalized_source = self._normalize_feature_rows(
+            self._normalize_columns(source_features)
+        )
+        normalized_reference = self._normalize_feature_rows(
+            self._normalize_columns(reference_features)
+        )
+        refined = list(ordered)
+
+        for index in candidate_boundary_indexes:
+            previous = refined[index - 1]
+            current = refined[index]
+            previous_duration = previous.reference_duration_seconds or previous.duration_seconds
+            current_duration = current.reference_duration_seconds or current.duration_seconds
+            previous_end = previous.reference_start_seconds + previous_duration
+            current_start = current.reference_start_seconds
+            if current_start - previous_end > 0.5:
+                continue
+
+            previous_offset = previous.source_start_seconds - (
+                previous.reference_start_seconds * previous.tempo_factor
+            )
+            current_offset = current.source_start_seconds - (
+                current.reference_start_seconds * current.tempo_factor
+            )
+            if abs(current_offset - previous_offset) <= max(
+                0.5,
+                min(previous_duration, current_duration) * 0.08,
+            ):
+                continue
+
+            expected_boundary = (previous_end + current_start) / 2
+            lower_boundary = max(
+                previous.reference_start_seconds + self.minimum_segment_seconds,
+                expected_boundary - search_radius_frames / feature_rate,
+            )
+            upper_boundary = min(
+                current_start + current_duration - self.minimum_segment_seconds,
+                expected_boundary + search_radius_frames / feature_rate,
+            )
+            if upper_boundary <= lower_boundary:
+                continue
+
+            lower_frame = max(0, round(lower_boundary * feature_rate))
+            upper_frame = min(
+                reference_features.shape[0] - 1,
+                round(upper_boundary * feature_rate),
+            )
+            reference_indexes = np.arange(lower_frame, upper_frame + 1)
+            previous_similarity = self._mapped_alignment_similarity(
+                normalized_source,
+                normalized_reference,
+                reference_indexes,
+                offset_seconds=previous_offset,
+                tempo_factor=previous.tempo_factor,
+            )
+            current_similarity = self._mapped_alignment_similarity(
+                normalized_source,
+                normalized_reference,
+                reference_indexes,
+                offset_seconds=current_offset,
+                tempo_factor=current.tempo_factor,
+            )
+            if previous_similarity is None or current_similarity is None:
+                continue
+
+            prefix_previous = np.concatenate(([0.0], np.cumsum(previous_similarity)))
+            suffix_current = np.concatenate(
+                (np.cumsum(current_similarity[::-1])[::-1], [0.0])
+            )
+            candidate_scores = (
+                prefix_previous + suffix_current
+            ) / max(1, reference_indexes.size)
+            best_cut_index = int(np.argmax(candidate_scores))
+            best_cut_score = float(candidate_scores[best_cut_index])
+            no_cut_score = max(
+                float(candidate_scores[0]),
+                float(candidate_scores[-1]),
+            )
+            if best_cut_index in (0, candidate_scores.size - 1) or best_cut_score <= (
+                no_cut_score + 0.01
+            ):
+                continue
+            best_boundary = (lower_frame + best_cut_index) / feature_rate
+            if abs(best_boundary - expected_boundary) > search_radius_frames / feature_rate:
+                continue
+
+            previous_new_duration = best_boundary - previous.reference_start_seconds
+            current_new_duration = (
+                current_start + current_duration - best_boundary
+            )
+            if min(previous_new_duration, current_new_duration) < self.minimum_segment_seconds:
+                continue
+
+            previous_source_end = (
+                previous.source_start_seconds
+                + previous_new_duration * previous.tempo_factor
+            )
+            current_source_start = current.source_start_seconds + (
+                best_boundary - current_start
+            ) * current.tempo_factor
+            refined[index - 1] = replace(
+                previous,
+                duration_seconds=previous_new_duration * previous.tempo_factor,
+                reference_duration_seconds=previous_new_duration,
+            )
+            refined[index] = replace(
+                current,
+                source_start_seconds=current_source_start,
+                reference_start_seconds=best_boundary,
+                duration_seconds=current_new_duration * current.tempo_factor,
+                reference_duration_seconds=current_new_duration,
+            )
+            logger.debug(
+                "Refined audio edit boundary %.3fs -> %.3fs (alignments %.3fs / %.3fs)",
+                expected_boundary,
+                best_boundary,
+                previous_source_end,
+                current_source_start,
+            )
+
+        return refined
+
+    @staticmethod
+    def _mapped_alignment_similarity(
+        source_features: np.ndarray,
+        reference_features: np.ndarray,
+        reference_indexes: np.ndarray,
+        *,
+        offset_seconds: float,
+        tempo_factor: float,
+    ) -> np.ndarray | None:
+        source_positions = (
+            reference_indexes / AudioMatchingService.feature_rate * tempo_factor
+            + offset_seconds
+        ) * AudioMatchingService.feature_rate
+        source_positions = np.rint(source_positions).astype(np.int64)
+        if (
+            source_positions.size == 0
+            or source_positions.min() < 0
+            or source_positions.max() >= source_features.shape[0]
+        ):
+            return None
+        return np.sum(
+            reference_features[reference_indexes] * source_features[source_positions],
+            axis=1,
+        )
+
+    @staticmethod
+    def _weighted_average_match_score(matches: list[AudioSegmentMatch]) -> float:
+        duration = AudioMatchingService._matched_reference_duration(matches)
+        if duration <= 0:
+            return 0.0
+        return sum(
+            match.score * (match.reference_duration_seconds or match.duration_seconds)
+            for match in matches
+        ) / duration
+
+    @staticmethod
+    def _has_discontinuous_match_alignment(matches: list[AudioSegmentMatch]) -> bool:
+        if len(matches) < 2:
+            return False
+
+        ordered = sorted(matches, key=lambda match: match.reference_start_seconds)
+        baseline = ordered[0].source_start_seconds - (
+            ordered[0].reference_start_seconds * ordered[0].tempo_factor
+        )
+        for match in ordered[1:]:
+            offset = match.source_start_seconds - (
+                match.reference_start_seconds * match.tempo_factor
+            )
+            tolerance = max(
+                0.5,
+                (match.reference_duration_seconds or match.duration_seconds) * 0.08,
+            )
+            if abs(offset - baseline) > tolerance:
+                return True
+        return False
+
+    @staticmethod
+    def _select_non_overlapping_reference_matches(
+        candidates: list[AudioSegmentMatch],
+    ) -> list[AudioSegmentMatch]:
+        """Combine strong partial scans without double-counting reference time."""
+        if not candidates:
+            return []
+
+        ordered = sorted(
+            candidates,
+            key=lambda match: (
+                match.reference_start_seconds
+                + (match.reference_duration_seconds or match.duration_seconds),
+                match.reference_start_seconds,
+                -match.score,
+            ),
+        )
+        best_scores: list[float] = []
+        best_paths: list[list[AudioSegmentMatch]] = []
+        for index, match in enumerate(ordered):
+            match_duration = match.reference_duration_seconds or match.duration_seconds
+            match_end = match.reference_start_seconds + match_duration
+            predecessor = next(
+                (
+                    previous_index
+                    for previous_index in range(index - 1, -1, -1)
+                    if ordered[previous_index].reference_start_seconds
+                    + (
+                        ordered[previous_index].reference_duration_seconds
+                        or ordered[previous_index].duration_seconds
+                    )
+                    <= match.reference_start_seconds + 1e-6
+                ),
+                None,
+            )
+            previous_score = best_scores[predecessor] if predecessor is not None else 0.0
+            previous_path = best_paths[predecessor] if predecessor is not None else []
+            take_score = previous_score + (match_duration * match.score)
+            skip_score = best_scores[index - 1] if index > 0 else 0.0
+            if take_score >= skip_score:
+                best_scores.append(take_score)
+                best_paths.append([*previous_path, match])
+            else:
+                best_scores.append(skip_score)
+                best_paths.append(best_paths[index - 1].copy())
+
+        selected = best_paths[-1]
+        return sorted(selected, key=lambda match: match.reference_start_seconds)
+
+    def _scan_short_windows_with_concordance(
+        self,
+        reference_features: np.ndarray,
+        *,
+        search_indexes: tuple[FeatureSearchIndex, FeatureSearchIndex],
+        scene_boundaries: tuple[float, ...],
+    ) -> tuple[list[AudioSegmentMatch], float]:
+        feature_rate = self.feature_rate
+        reference_frames = reference_features.shape[0]
+        window_frames = round(self.concordance_window_seconds * feature_rate)
+        step_frames = round(self.concordance_step_seconds * feature_rate)
+        minimum_scene_frames = round(feature_rate)
+        scene_edges = [0]
+        for boundary in sorted(scene_boundaries):
+            frame = round(boundary * feature_rate)
+            if (
+                frame - scene_edges[-1] >= minimum_scene_frames
+                and reference_frames - frame >= minimum_scene_frames
+            ):
+                scene_edges.append(frame)
+        scene_edges.append(reference_frames)
+
+        matches: list[AudioSegmentMatch] = []
+        best_score = 0.0
+        candidate_windows: list[list[AudioSegmentMatch]] = []
+        for scene_start, scene_end in zip(scene_edges[:-1], scene_edges[1:], strict=True):
+            scene_length = scene_end - scene_start
+            if scene_length < minimum_scene_frames:
+                continue
+            scene_window_frames = min(window_frames, scene_length)
+            starts = list(
+                range(scene_start, scene_end - scene_window_frames + 1, step_frames)
+            )
+            final_start = scene_end - scene_window_frames
+            if not starts or starts[-1] != final_start:
+                starts.append(final_start)
+
+            for reference_start_frame in starts:
+                reference_window = reference_features[
+                    reference_start_frame : reference_start_frame + scene_window_frames
+                ]
+                top_candidates = self._find_top_short_window_candidates(
+                    search_indexes,
+                    reference_window,
+                    limit=self.concordance_top_candidates,
+                )
+                window_matches: list[AudioSegmentMatch] = []
+                for source_start_frame, score in top_candidates:
+                    best_score = max(best_score, score)
+                    if score < self.concordance_minimum_score:
+                        continue
+                    duration = scene_window_frames / feature_rate
+                    window_matches.append(
+                        AudioSegmentMatch(
+                            source_start_seconds=source_start_frame / feature_rate,
+                            reference_start_seconds=reference_start_frame / feature_rate,
+                            duration_seconds=duration,
+                            score=score,
+                            reference_duration_seconds=duration,
+                        )
+                    )
+                candidate_windows.append(window_matches)
+
+        remaining_windows = [list(window) for window in candidate_windows]
+        while True:
+            path = self._best_concordant_window_path(
+                remaining_windows,
+                step_seconds=step_frames / feature_rate,
+            )
+            if len(path) < self.concordance_minimum_windows:
+                break
+
+            first = path[0]
+            last = path[-1]
+            reference_end = last.reference_start_seconds + (
+                last.reference_duration_seconds or last.duration_seconds
+            )
+            reference_start = first.reference_start_seconds
+            reference_duration = reference_end - reference_start
+            reference_span = last.reference_start_seconds - reference_start
+            tempo_factor = (
+                (last.source_start_seconds - first.source_start_seconds) / reference_span
+                if reference_span > 0
+                else 1.0
+            )
+            average_score = self._weighted_average_match_score(path)
+            if (
+                average_score >= self.minimum_average_match_score
+                and 0.8 <= tempo_factor <= 1.2
+            ):
+                matches.append(
+                    AudioSegmentMatch(
+                        source_start_seconds=first.source_start_seconds,
+                        reference_start_seconds=reference_start,
+                        duration_seconds=reference_duration * tempo_factor,
+                        score=average_score,
+                        reference_duration_seconds=reference_duration,
+                        tempo_factor=tempo_factor,
+                    )
+                )
+
+            # Consume the reference interval whether or not this path passed its
+            # quality gate, then search the remaining scenes for other source runs.
+            changed = False
+            for index, window in enumerate(remaining_windows):
+                retained = [
+                    candidate
+                    for candidate in window
+                    if (
+                        candidate.reference_start_seconds
+                        + (candidate.reference_duration_seconds or candidate.duration_seconds)
+                        <= reference_start
+                        or candidate.reference_start_seconds >= reference_end
+                    )
+                ]
+                if len(retained) != len(window):
+                    remaining_windows[index] = retained
+                    changed = True
+            if not changed:
+                break
+
+        return self._select_non_overlapping_reference_matches(matches), best_score
+
+    def _find_top_short_window_candidates(
+        self,
+        search_indexes: tuple[FeatureSearchIndex, FeatureSearchIndex],
+        reference_features: np.ndarray,
+        *,
+        limit: int,
+    ) -> list[tuple[int, float]]:
+        spectral_index, fingerprint_index = search_indexes
+        spectral_scores = self._feature_match_scores(spectral_index, reference_features)
+        reference_fingerprint = self._binary_fingerprint(reference_features)
+        fingerprint_scores = self._feature_match_scores(
+            fingerprint_index,
+            reference_fingerprint,
+            allow_empty=True,
+        )
+        scores = self._combine_feature_evidence(
+            spectral_scores,
+            fingerprint_scores,
+        )
+        candidate_scores = scores.copy()
+        suppression_radius = max(
+            1,
+            round(self.concordance_window_seconds * self.feature_rate / 2),
+        )
+        candidates: list[tuple[int, float]] = []
+        for _ in range(limit):
+            frame = int(np.argmax(candidate_scores))
+            raw_score = float(candidate_scores[frame])
+            if not np.isfinite(raw_score) or raw_score <= 0:
+                break
+            confidence = self._calibrate_match_confidence(
+                scores,
+                frame,
+                reference_features.shape[0],
+            )
+            candidates.append((frame, confidence))
+            candidate_scores[
+                max(0, frame - suppression_radius) : frame + suppression_radius + 1
+            ] = -np.inf
+        return candidates
+
+    def _best_concordant_window_path(
+        self,
+        candidate_windows: list[list[AudioSegmentMatch]],
+        *,
+        step_seconds: float,
+    ) -> list[AudioSegmentMatch]:
+        scores: list[list[float]] = []
+        lengths: list[list[int]] = []
+        previous_nodes: list[list[tuple[int, int] | None]] = []
+
+        for window_index, candidates in enumerate(candidate_windows):
+            window_scores = [candidate.score for candidate in candidates]
+            window_lengths = [1] * len(candidates)
+            window_previous: list[tuple[int, int] | None] = [None] * len(candidates)
+            if window_index > 0:
+                prior_candidates = candidate_windows[window_index - 1]
+                for candidate_index, candidate in enumerate(candidates):
+                    for prior_index, prior in enumerate(prior_candidates):
+                        source_step = (
+                            candidate.source_start_seconds - prior.source_start_seconds
+                        )
+                        reference_step = (
+                            candidate.reference_start_seconds - prior.reference_start_seconds
+                        )
+                        allowed_position_drift = max(
+                            self.concordance_position_tolerance_floor_seconds,
+                            reference_step * self.concordance_position_tolerance_ratio
+                            + (2 / self.feature_rate),
+                        )
+                        if source_step <= 0 or abs(source_step - reference_step) > (
+                            allowed_position_drift
+                        ):
+                            continue
+                        proposed_length = lengths[window_index - 1][prior_index] + 1
+                        proposed_score = scores[window_index - 1][prior_index] + candidate.score
+                        if (
+                            proposed_length > window_lengths[candidate_index]
+                            or (
+                                proposed_length == window_lengths[candidate_index]
+                                and proposed_score > window_scores[candidate_index]
+                            )
+                        ):
+                            window_lengths[candidate_index] = proposed_length
+                            window_scores[candidate_index] = proposed_score
+                            window_previous[candidate_index] = (window_index - 1, prior_index)
+            scores.append(window_scores)
+            lengths.append(window_lengths)
+            previous_nodes.append(window_previous)
+
+        best_endpoint: tuple[int, int] | None = None
+        best_key = (0, 0.0)
+        for window_index, window_lengths in enumerate(lengths):
+            for candidate_index, path_length in enumerate(window_lengths):
+                path_score = scores[window_index][candidate_index]
+                key = (path_length, path_score / path_length)
+                if key > best_key:
+                    best_key = key
+                    best_endpoint = (window_index, candidate_index)
+
+        if best_endpoint is None or best_key[0] < self.concordance_minimum_windows:
+            return []
+
+        path: list[AudioSegmentMatch] = []
+        node: tuple[int, int] | None = best_endpoint
+        while node is not None:
+            window_index, candidate_index = node
+            path.append(candidate_windows[window_index][candidate_index])
+            node = previous_nodes[window_index][candidate_index]
+        path.reverse()
+
+        # A path must truly contain adjacent reference windows, not just a long
+        # chain accidentally connected after a scene/window gap.
+        if len(path) < self.concordance_minimum_windows or any(
+            current.reference_start_seconds - prior.reference_start_seconds
+            > max(
+                step_seconds * 1.5,
+                prior.reference_duration_seconds or prior.duration_seconds,
+            )
+            for prior, current in zip(path, path[1:])
+        ):
+            return []
+        return path
 
     def _scan_reference_segments(
         self,
@@ -540,6 +1209,7 @@ class AudioMatchingService:
         segment_seconds: float,
         offset_seconds: float,
         search_indexes: tuple[FeatureSearchIndex, FeatureSearchIndex],
+        reference_scene_boundaries: tuple[float, ...] = (),
     ) -> tuple[list[AudioSegmentMatch], float]:
         segment_frames = round(segment_seconds * self.feature_rate)
         minimum_frames = self.minimum_segment_seconds * self.feature_rate
@@ -552,13 +1222,27 @@ class AudioMatchingService:
             reference_features.shape[0],
             segment_frames,
         ):
+            reference_end_frame = min(
+                reference_start_frame + segment_frames,
+                reference_features.shape[0],
+            )
+            if any(
+                reference_start_frame < round(boundary * self.feature_rate) < reference_end_frame
+                for boundary in reference_scene_boundaries
+            ):
+                continue
             reference_segment = reference_features[
                 reference_start_frame : reference_start_frame + segment_frames
             ]
             if reference_segment.shape[0] < minimum_frames:
                 continue
 
-            source_start_frame, score, tempo_factor = self._find_best_tempo_match(
+            (
+                source_start_frame,
+                score,
+                tempo_factor,
+                pitch_shift_semitones,
+            ) = self._find_best_tempo_match_with_pitch(
                 source_features,
                 reference_segment,
                 search_indexes=search_indexes,
@@ -576,11 +1260,12 @@ class AudioMatchingService:
                     score=score,
                     reference_duration_seconds=reference_duration_seconds,
                     tempo_factor=tempo_factor,
+                    pitch_shift_semitones=pitch_shift_semitones,
                 )
             )
 
         return (
-            self._select_non_overlapping_source_matches(candidates),
+            self._select_chronological_matches(candidates),
             max(best_scores, default=0.0),
         )
 
@@ -597,10 +1282,27 @@ class AudioMatchingService:
         *,
         search_indexes: tuple[FeatureSearchIndex, FeatureSearchIndex] | None = None,
     ) -> tuple[int, float, float]:
+        best_frame, best_score, best_tempo_factor, _ = (
+            self._find_best_tempo_match_with_pitch(
+                source_features,
+                reference_features,
+                search_indexes=search_indexes,
+            )
+        )
+        return best_frame, best_score, best_tempo_factor
+
+    def _find_best_tempo_match_with_pitch(
+        self,
+        source_features: np.ndarray,
+        reference_features: np.ndarray,
+        *,
+        search_indexes: tuple[FeatureSearchIndex, FeatureSearchIndex] | None = None,
+    ) -> tuple[int, float, float, int]:
         indexes = search_indexes or self._build_feature_search_indexes(source_features)
         best_frame = 0
         best_score = float("-inf")
         best_tempo_factor = 1.0
+        best_pitch_shift_semitones = 0
         for tempo_factor in self.tempo_factors:
             adjusted_reference = self._resample_features(reference_features, tempo_factor)
             if adjusted_reference.shape[0] >= source_features.shape[0]:
@@ -619,7 +1321,56 @@ class AudioMatchingService:
                 best_frame = candidate_frame
                 best_score = candidate_score
                 best_tempo_factor = tempo_factor
-        return best_frame, best_score, best_tempo_factor
+
+        if best_score < self.pitch_shift_retry_threshold:
+            nearby_tempo_factors = [
+                factor
+                for factor in self.tempo_factors
+                if abs(factor - best_tempo_factor) <= self.pitch_shift_tempo_radius
+            ]
+
+            def evaluate_pitch_shifts(semitone_candidates: tuple[int, ...]) -> None:
+                nonlocal best_frame, best_score, best_tempo_factor
+                nonlocal best_pitch_shift_semitones
+                for semitones in semitone_candidates:
+                    pitch_adjusted_reference = self._shift_spectral_feature_pitch(
+                        reference_features,
+                        semitones=semitones,
+                    )
+                    for tempo_factor in nearby_tempo_factors:
+                        adjusted_reference = self._resample_features(
+                            pitch_adjusted_reference,
+                            tempo_factor,
+                        )
+                        if adjusted_reference.shape[0] >= source_features.shape[0]:
+                            continue
+                        candidate_frame, candidate_score = self._find_best_match_with_indexes(
+                            indexes,
+                            adjusted_reference,
+                        )
+                        logger.debug(
+                            "Candidato de tom %+d semitons e velocidade %.3f: "
+                            "confiança %.4f no frame %s",
+                            semitones,
+                            tempo_factor,
+                            candidate_score,
+                            candidate_frame,
+                        )
+                        if candidate_score > best_score:
+                            best_frame = candidate_frame
+                            best_score = candidate_score
+                            best_tempo_factor = tempo_factor
+                            best_pitch_shift_semitones = semitones
+
+            evaluate_pitch_shifts(self.pitch_shift_retry_semitones)
+            if (
+                self.pitch_shift_extended_retry_floor
+                <= best_score
+                < self.pitch_shift_retry_threshold
+            ):
+                evaluate_pitch_shifts(self.pitch_shift_extended_retry_semitones)
+
+        return best_frame, best_score, best_tempo_factor, best_pitch_shift_semitones
 
     @staticmethod
     def _resample_features(features: np.ndarray, tempo_factor: float) -> np.ndarray:
@@ -637,6 +1388,47 @@ class AudioMatchingService:
                 features[:, column_index],
             )
         return adjusted
+
+    def _shift_spectral_feature_pitch(
+        self,
+        features: np.ndarray,
+        *,
+        semitones: int,
+    ) -> np.ndarray:
+        """Remap mel bands to tolerate modest pitch-shifted copies of a clip."""
+        band_count = features.shape[1] // 2
+        minimum_mel = self._hertz_to_mel(self.minimum_analysis_frequency)
+        maximum_mel = self._hertz_to_mel(self.maximum_analysis_frequency)
+        mel_centers = np.linspace(minimum_mel, maximum_mel, band_count + 2)[1:-1]
+        pitch_ratio = 2 ** (semitones / 12)
+        target_mels = self._hertz_to_mel(self._mel_to_hertz(mel_centers) * pitch_ratio)
+        source_band_indexes = np.interp(
+            target_mels,
+            mel_centers,
+            np.arange(band_count),
+            left=0,
+            right=band_count - 1,
+        )
+        lower_indexes = np.floor(source_band_indexes).astype(np.intp)
+        upper_indexes = np.ceil(source_band_indexes).astype(np.intp)
+        interpolation = source_band_indexes - lower_indexes
+
+        shifted_energy = (
+            features[:, lower_indexes]
+            + interpolation * (features[:, upper_indexes] - features[:, lower_indexes])
+        )
+        shifted_changes = (
+            features[:, band_count + lower_indexes]
+            + interpolation
+            * (
+                features[:, band_count + upper_indexes]
+                - features[:, band_count + lower_indexes]
+            )
+        )
+        return np.concatenate((shifted_energy, shifted_changes), axis=1).astype(
+            features.dtype,
+            copy=False,
+        )
 
     def _spectral_features_from_samples(self, samples: np.ndarray) -> np.ndarray:
         hop_size = self.analysis_sample_rate // self.feature_rate
@@ -710,6 +1502,150 @@ class AudioMatchingService:
             reference_features,
         )
 
+    def _spectral_landmark_hashes(
+        self,
+        samples: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Extract sparse peak-pair hashes and their anchor-frame times."""
+        sample_rate = self.analysis_sample_rate
+        frame_size = 1_024
+        hop_size = sample_rate // self.feature_rate
+        if samples.size < frame_size:
+            return np.empty(0, dtype=np.uint32), np.empty(0, dtype=np.int32)
+
+        frames = np.lib.stride_tricks.sliding_window_view(samples, frame_size)[::hop_size]
+        window = np.hanning(frame_size).astype(np.float32)
+        magnitudes = np.abs(np.fft.rfft(frames * window, axis=1)).astype(np.float32)
+        magnitudes[:, 0] = 0.0
+
+        padded = np.pad(magnitudes, ((1, 1), (1, 1)), mode="constant")
+        neighbors = (
+            padded[:-2, 1:-1],
+            padded[2:, 1:-1],
+            padded[1:-1, :-2],
+            padded[1:-1, 2:],
+        )
+        is_peak = np.ones(magnitudes.shape, dtype=bool)
+        for neighbor in neighbors:
+            is_peak &= magnitudes >= neighbor
+
+        low_bin = max(1, round(self.minimum_analysis_frequency * frame_size / sample_rate))
+        high_bin = min(
+            magnitudes.shape[1] - 1,
+            round(self.maximum_analysis_frequency * frame_size / sample_rate),
+        )
+        is_peak[:, :low_bin] = False
+        is_peak[:, high_bin + 1 :] = False
+
+        peaks_by_frame: list[list[tuple[int, float]]] = []
+        for frame_index, frame_peaks in enumerate(is_peak):
+            bins = np.flatnonzero(frame_peaks)
+            if bins.size > 4:
+                strengths = magnitudes[frame_index, bins]
+                bins = bins[np.argpartition(strengths, -4)[-4:]]
+            peaks_by_frame.append(
+                [
+                    (int(bin_index), float(magnitudes[frame_index, bin_index]))
+                    for bin_index in bins
+                ]
+            )
+
+        unique_landmarks: set[tuple[int, int]] = set()
+        max_target_frame_delta = min(32, 2**5 - 1)
+        for anchor_frame, anchor_peaks in enumerate(peaks_by_frame):
+            for first_bin, _ in anchor_peaks:
+                targets: list[tuple[float, int, int]] = []
+                last_frame = min(len(peaks_by_frame), anchor_frame + max_target_frame_delta + 1)
+                for target_frame in range(anchor_frame + 2, last_frame):
+                    frame_delta = target_frame - anchor_frame
+                    for second_bin, strength in peaks_by_frame[target_frame]:
+                        frequency_delta = second_bin - first_bin
+                        if not 0 < frequency_delta <= 63:
+                            continue
+                        targets.append((strength, second_bin, frame_delta))
+                if not targets:
+                    continue
+
+                targets.sort(reverse=True)
+                for _, second_bin, frame_delta in targets[:3]:
+                    first_quantized = first_bin // 2
+                    second_quantized = second_bin // 2
+                    time_quantized = frame_delta // 2
+                    landmark_hash = (
+                        (first_quantized << 13) | (second_quantized << 5) | time_quantized
+                    )
+                    unique_landmarks.add((landmark_hash, anchor_frame))
+
+        if not unique_landmarks:
+            return np.empty(0, dtype=np.uint32), np.empty(0, dtype=np.int32)
+        ordered = sorted(unique_landmarks, key=lambda item: item[1])
+        return (
+            np.fromiter((item[0] for item in ordered), dtype=np.uint32),
+            np.fromiter((item[1] for item in ordered), dtype=np.int32),
+        )
+
+    def _find_landmark_alignment(
+        self,
+        source_samples: np.ndarray,
+        reference_samples: np.ndarray,
+    ) -> tuple[float, int, int] | None:
+        """Vote for a shared time offset using temporally consistent peak pairs."""
+        source_hashes, source_frames = self._spectral_landmark_hashes(source_samples)
+        reference_hashes, reference_frames = self._spectral_landmark_hashes(reference_samples)
+        if reference_hashes.size < 20:
+            return None
+
+        source_index: dict[int, list[int]] = {}
+        for fingerprint, frame in zip(source_hashes, source_frames, strict=True):
+            source_index.setdefault(int(fingerprint), []).append(int(frame))
+
+        offsets: list[int] = []
+        reference_indexes: list[int] = []
+        for reference_index, (fingerprint, reference_frame) in enumerate(
+            zip(reference_hashes, reference_frames, strict=True)
+        ):
+            for source_frame in source_index.get(int(fingerprint), ()):
+                offsets.append(source_frame - int(reference_frame))
+                reference_indexes.append(reference_index)
+        if not offsets:
+            return None
+
+        # A 40 ms bin absorbs one-frame peak jitter while preserving useful cut precision.
+        offset_bins = np.rint(np.asarray(offsets, dtype=np.float64) / 2).astype(np.int32)
+        votes_by_bin: dict[int, set[int]] = {}
+        for offset_bin, reference_index in zip(
+            offset_bins,
+            reference_indexes,
+            strict=True,
+        ):
+            votes_by_bin.setdefault(int(offset_bin), set()).add(reference_index)
+
+        cluster_votes: dict[int, set[int]] = {}
+        for offset_bin in votes_by_bin:
+            inliers: set[int] = set()
+            for neighbor_bin in range(offset_bin - 1, offset_bin + 2):
+                inliers.update(votes_by_bin.get(neighbor_bin, ()))
+            cluster_votes[offset_bin] = inliers
+
+        best_bin = max(cluster_votes, key=lambda candidate: len(cluster_votes[candidate]))
+        best_inliers = cluster_votes[best_bin]
+        alternative_count = max(
+            (
+                len(inliers)
+                for candidate, inliers in cluster_votes.items()
+                if abs(candidate - best_bin) > 2
+            ),
+            default=0,
+        )
+        inlier_count = len(best_inliers)
+        if inlier_count < 6 or inlier_count / reference_hashes.size < 0.01:
+            return None
+        if alternative_count >= inlier_count * 0.8:
+            return None
+
+        offset_seconds = best_bin * 2 / self.feature_rate
+        return offset_seconds, inlier_count, int(reference_hashes.size)
+
     @staticmethod
     def _build_feature_search_indexes(
         source_features: np.ndarray,
@@ -745,10 +1681,9 @@ class AudioMatchingService:
             reference_fingerprint,
             allow_empty=True,
         )
-        spectral_evidence = np.clip(spectral_scores, 0.0, 1.0)
-        fingerprint_evidence = np.clip(fingerprint_scores, 0.0, 1.0)
-        combined_scores = 1.0 - (
-            (1.0 - spectral_evidence) * (1.0 - fingerprint_evidence)
+        combined_scores = AudioMatchingService._combine_feature_evidence(
+            spectral_scores,
+            fingerprint_scores,
         )
         best_frame = int(np.argmax(combined_scores))
         confidence = AudioMatchingService._calibrate_match_confidence(
@@ -757,6 +1692,20 @@ class AudioMatchingService:
             reference_features.shape[0],
         )
         return best_frame, confidence
+
+    @staticmethod
+    def _combine_feature_evidence(
+        spectral_scores: np.ndarray,
+        fingerprint_scores: np.ndarray,
+    ) -> np.ndarray:
+        """Blend correlated views of the same spectrogram without inflating confidence."""
+        spectral_weight = AudioMatchingService.spectral_evidence_weight
+        return np.clip(
+            spectral_weight * np.clip(spectral_scores, 0.0, 1.0)
+            + (1.0 - spectral_weight) * np.clip(fingerprint_scores, 0.0, 1.0),
+            0.0,
+            1.0,
+        )
 
     @staticmethod
     def _calibrate_match_confidence(
@@ -780,7 +1729,17 @@ class AudioMatchingService:
             np.clip((best_score - runner_up) / max(best_score, 1e-12), 0.0, 1.0)
         )
         evidence_strength = float(np.clip((best_score - 0.2) / 0.25, 0.0, 1.0))
-        return best_score + ((1.0 - best_score) * uniqueness * evidence_strength)
+        # Treat near-identical, distant peaks as an ambiguous location. A moderate
+        # runner-up should not erase evidence from a clean match, but an almost
+        # tied second location must not leave the result at near-100% confidence.
+        if best_score >= 0.6 and uniqueness < 0.05:
+            return best_score * 0.4
+
+        uniqueness_bonus = min(
+            0.05,
+            (1.0 - best_score) * uniqueness * evidence_strength * 0.05,
+        )
+        return best_score + uniqueness_bonus
 
     @staticmethod
     def _binary_fingerprint(features: np.ndarray) -> np.ndarray:
@@ -925,6 +1884,11 @@ class AudioMatchingService:
         ]
         if reference_segment.shape[0] < self.minimum_segment_seconds * self.feature_rate:
             return match
+        if match.pitch_shift_semitones:
+            reference_segment = self._shift_spectral_feature_pitch(
+                reference_segment,
+                semitones=match.pitch_shift_semitones,
+            )
 
         predicted_start_frame = round(match.source_start_seconds * self.feature_rate)
         expected_source_frames = max(1, round(match.duration_seconds * self.feature_rate))
@@ -951,36 +1915,7 @@ class AudioMatchingService:
         ).astype(np.float32, copy=False)
         costs = np.subtract(1.0, similarities, dtype=np.float32)
         reference_frames, source_frames = costs.shape
-        accumulated = np.full(
-            (reference_frames + 1, source_frames + 1),
-            np.inf,
-            dtype=np.float32,
-        )
-        accumulated[0, :] = 0.0
-        steps = np.zeros((reference_frames + 1, source_frames + 1), dtype=np.uint8)
-
-        for reference_index in range(1, reference_frames + 1):
-            for source_index in range(1, source_frames + 1):
-                diagonal = accumulated[reference_index - 1, source_index - 1]
-                vertical = (
-                    accumulated[reference_index - 1, source_index] + self.dtw_step_penalty
-                )
-                horizontal = (
-                    accumulated[reference_index, source_index - 1] + self.dtw_step_penalty
-                )
-                if diagonal <= vertical and diagonal <= horizontal:
-                    previous_cost = diagonal
-                    step = 0
-                elif vertical <= horizontal:
-                    previous_cost = vertical
-                    step = 1
-                else:
-                    previous_cost = horizontal
-                    step = 2
-                accumulated[reference_index, source_index] = (
-                    costs[reference_index - 1, source_index - 1] + previous_cost
-                )
-                steps[reference_index, source_index] = step
+        accumulated, steps = self._subsequence_dtw_costs(costs, self.dtw_step_penalty)
 
         source_index = int(np.argmin(accumulated[reference_frames, 1:])) + 1
         reference_index = reference_frames
@@ -1022,7 +1957,48 @@ class AudioMatchingService:
             duration_seconds=refined_duration,
             score=combined_score,
             tempo_factor=refined_tempo_factor,
+            alignment_confirmation_score=path_similarity,
         )
+
+    @staticmethod
+    def _subsequence_dtw_costs(
+        costs: np.ndarray,
+        step_penalty: float,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Compute open-begin subsequence DTW with vectorized row recurrences."""
+        reference_frames, source_frames = costs.shape
+        accumulated = np.full(
+            (reference_frames + 1, source_frames + 1),
+            np.inf,
+            dtype=np.float64,
+        )
+        accumulated[0, :] = 0.0
+        steps = np.zeros((reference_frames + 1, source_frames + 1), dtype=np.uint8)
+        source_indexes = np.arange(source_frames)
+
+        for reference_index in range(1, reference_frames + 1):
+            previous_row = accumulated[reference_index - 1]
+            diagonal = previous_row[:-1]
+            vertical = previous_row[1:] + step_penalty
+            local_costs = costs[reference_index - 1]
+            base_costs = local_costs + np.minimum(diagonal, vertical)
+
+            # A horizontal DTW step adds local_cost + penalty. Prefix minima
+            # turn its left-to-right recurrence into vector operations.
+            horizontal_costs = local_costs + step_penalty
+            cumulative_horizontal = np.cumsum(horizontal_costs, dtype=np.float64)
+            prefix_candidates = base_costs - cumulative_horizontal
+            prefix_minima = np.minimum.accumulate(prefix_candidates)
+            prefix_indexes = np.maximum.accumulate(
+                np.where(prefix_candidates <= prefix_minima, source_indexes, -1)
+            )
+
+            accumulated[reference_index, 1:] = cumulative_horizontal + prefix_minima
+            starts_here = prefix_indexes == source_indexes
+            base_steps = np.where(diagonal <= vertical, 0, 1).astype(np.uint8)
+            steps[reference_index, 1:] = np.where(starts_here, base_steps, 2)
+
+        return accumulated, steps
 
     def _refine_segment_match(
         self,
@@ -1042,7 +2018,9 @@ class AudioMatchingService:
         reference_segment = reference_samples[reference_start:reference_end]
         if reference_segment.size < sample_rate * self.minimum_segment_seconds:
             if require_score:
-                raise AudioMatchNotFoundError("O trecho é curto demais para confirmar a correspondência.")
+                raise AudioMatchNotFoundError(
+                    "O trecho é curto demais para confirmar a correspondência."
+                )
             return match
 
         padding = self.refinement_search_seconds * sample_rate
@@ -1052,26 +2030,49 @@ class AudioMatchingService:
         source_search_region = source_samples[search_start:search_end]
         if source_search_region.size <= reference_segment.size:
             if require_score:
-                raise AudioMatchNotFoundError("Não há áudio suficiente para confirmar o trecho encontrado.")
+                raise AudioMatchNotFoundError(
+                    "Não há áudio suficiente para confirmar o trecho encontrado."
+                )
             return match
 
         relative_start, refinement_score = self._find_best_match_in_samples(
             source_search_region, reference_segment
         )
+        landmark_alignment = self._find_landmark_alignment(
+            source_search_region,
+            reference_segment,
+        )
         if refinement_score < self.minimum_refinement_score:
-            if require_score:
+            if require_score and landmark_alignment is None:
+                if (
+                    match.pitch_shift_semitones
+                    and match.alignment_confirmation_score is not None
+                    and match.alignment_confirmation_score
+                    >= self.minimum_pitch_alignment_confirmation_score
+                ):
+                    return match
                 raise AudioMatchNotFoundError(
                     "A assinatura espectral parece semelhante, mas a forma de onda não confirmou "
-                    "o trecho com segurança."
+                    "o trecho, nem houve confirmação por fingerprints espectrais."
                 )
-            return match
+            if landmark_alignment is None:
+                return match
 
-        refined_start = (search_start + relative_start) / sample_rate
+        waveform_start = (search_start + relative_start) / sample_rate
+        if landmark_alignment is not None:
+            landmark_offset, inlier_count, _ = landmark_alignment
+            landmark_start = search_start / sample_rate + landmark_offset
+            waveform_disagrees = abs(waveform_start - landmark_start) > 0.18
+            if refinement_score < self.minimum_refinement_score or (
+                waveform_disagrees and inlier_count >= 12
+            ):
+                return replace(match, source_start_seconds=landmark_start)
+
         combined_score = max(
             match.score,
             (match.score * 0.7) + (refinement_score * 0.3),
         )
-        return replace(match, source_start_seconds=refined_start, score=combined_score)
+        return replace(match, source_start_seconds=waveform_start, score=combined_score)
 
     def _validate_reference_coverage(
         self,
@@ -1090,14 +2091,22 @@ class AudioMatchingService:
                 reference_duration * self.minimum_reference_coverage,
             ),
         )
-        if covered_duration < required_duration:
-            coverage = covered_duration / reference_duration if reference_duration else 0
+        coverage = covered_duration / reference_duration if reference_duration else 0
+        average_score = self._weighted_average_match_score(matches)
+        if (
+            covered_duration < required_duration
+            or average_score < self.minimum_average_match_score
+        ):
             confidence_detail = (
                 f", melhor confiança {best_score:.0%}" if best_score is not None else ""
             )
+            if covered_duration < required_duration:
+                reason = "Poucos trechos da referência foram confirmados no vídeo original"
+            else:
+                reason = "As correspondências ficaram abaixo da confiança média necessária"
             raise AudioMatchNotFoundError(
-                "Poucos trechos da referência foram confirmados no vídeo original "
-                f"(cobertura {coverage:.0%}{confidence_detail})."
+                f"{reason} (cobertura {coverage:.0%}, confiança média "
+                f"{average_score:.0%}{confidence_detail})."
             )
 
     @staticmethod
@@ -1153,65 +2162,6 @@ class AudioMatchingService:
 
         matches.reverse()
         return matches
-
-    @staticmethod
-    def _select_non_overlapping_source_matches(
-        candidates: list[AudioSegmentMatch],
-    ) -> list[AudioSegmentMatch]:
-        """Choose the largest non-overlapping source set, even if the reference is reordered."""
-        if not candidates:
-            return []
-
-        ordered = sorted(
-            candidates,
-            key=lambda match: (
-                match.source_start_seconds + match.duration_seconds,
-                match.source_start_seconds,
-                match.reference_start_seconds,
-            ),
-        )
-        source_ends = [
-            match.source_start_seconds + match.duration_seconds for match in ordered
-        ]
-        best: list[tuple[float, float]] = [(0.0, 0.0)]
-        compatible_counts: list[int] = []
-        take_current: list[bool] = []
-
-        for index, match in enumerate(ordered):
-            compatible_count = bisect_right(
-                source_ends,
-                match.source_start_seconds + 0.25,
-                hi=index,
-            )
-            compatible_counts.append(compatible_count)
-            reference_duration = match.reference_duration_seconds or match.duration_seconds
-            previous_coverage, previous_confidence = best[compatible_count]
-            take_value = (
-                previous_coverage + reference_duration,
-                previous_confidence + (reference_duration * match.score),
-            )
-            skip_value = best[-1]
-            take_wins = take_value[0] > skip_value[0] + 1e-9 or (
-                abs(take_value[0] - skip_value[0]) <= 1e-9
-                and take_value[1] > skip_value[1]
-            )
-            take_current.append(take_wins)
-            best.append(take_value if take_wins else skip_value)
-
-        selected: list[AudioSegmentMatch] = []
-        index = len(ordered)
-        while index > 0:
-            candidate_index = index - 1
-            if take_current[candidate_index]:
-                selected.append(ordered[candidate_index])
-                index = compatible_counts[candidate_index]
-            else:
-                index -= 1
-
-        # Keep the reference's sequence when rebuilding a montage; source and
-        # reference order are not necessarily the same after social-media edits.
-        selected.sort(key=lambda match: match.reference_start_seconds)
-        return selected
 
     @staticmethod
     def _normalize(values: np.ndarray) -> np.ndarray:
