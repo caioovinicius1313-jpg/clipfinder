@@ -774,6 +774,62 @@ class AudioMatchingService:
             ),
         )
         best_score = max((scan[1] for scan in selection_scans), default=0.0)
+        covered_duration = self._matched_reference_duration(selected_matches)
+        average_score = self._weighted_average_match_score(selected_matches)
+        required_duration = min(
+            reference_duration,
+            max(
+                float(self.minimum_segment_seconds),
+                reference_duration * self.minimum_reference_coverage,
+            ),
+        )
+        if (
+            covered_duration < required_duration
+            or average_score < self.minimum_average_match_score
+        ):
+            candidate_summary = [
+                {
+                    "segments": len(matches),
+                    "coverage": round(
+                        self._matched_reference_duration(matches)
+                        / max(reference_duration, 1e-12),
+                        3,
+                    ),
+                    "average_score": round(
+                        self._weighted_average_match_score(matches), 3
+                    ),
+                    "matches": [
+                        (
+                            round(match.reference_start_seconds, 2),
+                            round(match.source_start_seconds, 2),
+                            round(
+                                match.reference_duration_seconds
+                                or match.duration_seconds,
+                                2,
+                            ),
+                            round(match.score, 3),
+                        )
+                        for match in matches
+                    ],
+                }
+                for matches, _score in candidate_scans
+            ]
+            logger.warning(
+                "Audio match rejected: source_duration=%.2fs reference_duration=%.2fs "
+                "source_samples=%d reference_samples=%d scene_boundaries=%s "
+                "required_coverage=%.3f selected_coverage=%.3f "
+                "selected_average_score=%.3f best_score=%.3f candidates=%s",
+                analysis.source_samples.size / self.analysis_sample_rate,
+                reference_duration,
+                analysis.source_samples.size,
+                analysis.reference_samples.size,
+                [round(boundary, 2) for boundary in reference_scene_boundaries],
+                required_duration / max(reference_duration, 1e-12),
+                covered_duration / max(reference_duration, 1e-12),
+                average_score,
+                best_score,
+                candidate_summary,
+            )
         self._validate_reference_coverage(
             selected_matches,
             reference_duration,
