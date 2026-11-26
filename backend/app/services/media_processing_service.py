@@ -217,7 +217,8 @@ class MediaProcessingService:
             start_seconds=start_seconds,
             duration_seconds=duration_seconds,
             video_filter="pad=ceil(iw/2)*2:ceil(ih/2)*2",
-            crf="18",
+            crf="16",
+            preset="ultrafast",
         )
         if result.returncode == -9:
             logger.warning(
@@ -234,7 +235,8 @@ class MediaProcessingService:
                     "scale=1920:1920:force_original_aspect_ratio=decrease:"
                     "force_divisible_by=2"
                 ),
-                crf="17",
+                crf="16",
+                preset="ultrafast",
             )
         if result.returncode != 0:
             detail = self._ffmpeg_error_detail(result)
@@ -249,6 +251,7 @@ class MediaProcessingService:
         duration_seconds: float,
         video_filter: str,
         crf: str,
+        preset: str,
     ) -> subprocess.CompletedProcess[bytes]:
         command = [
             self.get_ffmpeg_executable(),
@@ -274,9 +277,7 @@ class MediaProcessingService:
             "-c:v",
             "libx264",
             "-preset",
-            "ultrafast",
-            "-tune",
-            "zerolatency",
+            preset,
             "-crf",
             crf,
             "-vf",

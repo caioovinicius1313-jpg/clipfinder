@@ -2660,8 +2660,39 @@ def test_generate_clip_retries_in_1080p_when_full_resolution_exceeds_memory(
     )
 
     assert commands[0].index("-threads") < commands[0].index("-i")
+    assert commands[0][commands[0].index("-preset") + 1] == "ultrafast"
+    assert commands[0][commands[0].index("-crf") + 1] == "16"
     assert commands[1][commands[1].index("-c:v") + 1] == "libx264"
+    assert commands[1][commands[1].index("-preset") + 1] == "ultrafast"
+    assert commands[1][commands[1].index("-crf") + 1] == "16"
     assert "scale=1920:1920" in commands[1][commands[1].index("-vf") + 1]
+
+
+def test_generate_clip_uses_original_resolution_without_realtime_tuning(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    media_service = MediaProcessingService()
+    monkeypatch.setattr(media_service, "get_ffmpeg_executable", lambda: "ffmpeg")
+    commands: list[list[str]] = []
+
+    def fake_run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[bytes]:
+        commands.append(command)
+        return subprocess.CompletedProcess(args=command, returncode=0, stdout=b"", stderr=b"")
+
+    monkeypatch.setattr("app.services.media_processing_service.subprocess.run", fake_run)
+
+    media_service.generate_clip(
+        source_path="original.mp4",
+        output_path=tmp_path / "clip.mp4",
+        start_seconds=10,
+        duration_seconds=20,
+    )
+
+    command = commands[0]
+    assert command[command.index("-preset") + 1] == "ultrafast"
+    assert command[command.index("-crf") + 1] == "16"
+    assert "scale=" not in command[command.index("-vf") + 1]
+    assert "-tune" not in command
 
 
 def test_failed_clip_error_preserves_the_end() -> None:
